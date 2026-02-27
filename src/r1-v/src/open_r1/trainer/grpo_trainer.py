@@ -454,6 +454,33 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
             
         if self.temporal and video_inputs:
+            # [Task A] Multiple Destruction Mechanism: Shuffle, Reverse, or Masking
+            import random
+            num_frames = video_inputs[0].size(0)
+            destruction_type = random.choice(["shuffle", "reverse", "mask"])
+
+            if destruction_type == "shuffle":
+                # 1. Temporal Shuffle (Baseline approach)
+                indices = torch.randperm(num_frames)
+                shuffled_video_inputs = [video_inputs[0][indices]]
+            
+            elif destruction_type == "reverse":
+                # 2. Temporal Reverse (Play video backward)
+                indices = torch.arange(num_frames - 1, -1, -1)
+                shuffled_video_inputs = [video_inputs[0][indices]]
+            
+            else:
+                # 3. Frame Masking (Randomly black out 50% of the frames)
+                shuffled_video = video_inputs[0].clone()
+                mask_indices = torch.randperm(num_frames)[:max(1, num_frames // 2)]
+                shuffled_video[mask_indices] = 0.0  # Set pixel values to zero
+                shuffled_video_inputs = [shuffled_video]
+            
+            # [BASELINE - Commented out for comparison]
+            # indices = torch.randperm(video_inputs[0].size(0))
+            # shuffled_video_inputs = [video_inputs[0][indices]]
+
+            '''
             indices = torch.randperm(video_inputs[0].size(0))
             shuffled_video_inputs = [video_inputs[0][indices]]
             shuffled_prompt_inputs = self.processing_class(
@@ -470,7 +497,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             if self.max_prompt_length is not None:
                 shuffled_prompt_ids = shuffled_prompt_ids[:, -self.max_prompt_length :]
                 shuffled_prompt_mask = shuffled_prompt_mask[:, -self.max_prompt_length :]
-        
+            '''
         
         # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
