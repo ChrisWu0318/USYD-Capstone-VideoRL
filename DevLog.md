@@ -12,8 +12,8 @@ Based on the Video-R1 baseline, upgrade the original "Binary Reward" to a "Multi
 ### Phase 2: Core Algorithm Modification - grpo_trainer.py (In Progress)
 - [x] Locate Reward Logic: Identified hardcoded binary reward logic at approx. line 530.
 - [x] Locate Data Processing: Identified single-direction destruction at approx. line 330.
-- [ ] Task A: Modify line 330 to introduce "Multiple Destruction" mechanism.
-- [ ] Task B: Modify line 530 to replace binary logic with "Marginal Reward".
+- [x] Task A: Modify line 330 to introduce "Multiple Destruction" mechanism.
+- [x] Task B: Modify line 530 to replace binary logic with "Marginal Reward".
 
 ### Phase 3: Compute Scaling & Full Training (Pending)
 - [ ] Write README.md and rent multi-GPU nodes for full RL training.

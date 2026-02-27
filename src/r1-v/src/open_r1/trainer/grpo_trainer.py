@@ -632,8 +632,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
             rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         
-
-        
         
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
@@ -641,14 +639,32 @@ class Qwen2VLGRPOTrainer(Trainer):
             acc_mean = temporal_rewards_per_func[:, 0].mean()
             shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
 
-            if acc_mean >= 0.8 * shuffled_acc_mean:
-                mask = temporal_rewards_per_func[:, 0] > 0.1
-                temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
-                temporal_rewards = torch.tensor([1.0]).to('cuda')
-            else:
-                temporal_rewards = torch.tensor([0.0]).to('cuda')
+            # [Task B] Marginal Reward System: Replacing Binary Logic with a Gradient Reward
+            # Calculation: Margin = (Normal_Acc - Destroyed_Acc) / Normal_Acc
+            # This captures how much the model relies on the correct temporal sequence.
+            
+            margin = (acc_mean - shuffled_acc_mean) / (acc_mean + 1e-6)
+            
+            # Marginal Boost: Scale the margin (e.g., 0.5) and ensure it is non-negative
+            marginal_boost = torch.clamp(margin, min=0.0) * 0.5
+            
+            # Apply the dynamic boost to rewards exceeding the threshold (0.1)
+            mask = temporal_rewards_per_func[:, 0] > 0.1
+            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + marginal_boost
+            
+            # Assign for metrics logging
+            temporal_rewards = torch.tensor([marginal_boost.item()]).to(device)
+
+            # [BASELINE - Commented out for comparison]
+            # if acc_mean >= 0.8 * shuffled_acc_mean:
+            #     mask = temporal_rewards_per_func[:, 0] > 0.1
+            #     temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
+            #     temporal_rewards = torch.tensor([1.0]).to('cuda')
+            # else:
+            #     temporal_rewards = torch.tensor([0.0]).to('cuda')
         else:
-            temporal_rewards =  torch.tensor([0.5]).to('cuda')
+            # Default value for non-temporal or image-only samples
+            temporal_rewards = torch.tensor([0.5]).to(device)
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:
