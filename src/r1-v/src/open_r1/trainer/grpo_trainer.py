@@ -480,9 +480,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             # indices = torch.randperm(video_inputs[0].size(0))
             # shuffled_video_inputs = [video_inputs[0][indices]]
 
-            '''
-            indices = torch.randperm(video_inputs[0].size(0))
-            shuffled_video_inputs = [video_inputs[0][indices]]
             shuffled_prompt_inputs = self.processing_class(
                 text=copy.deepcopy(prompts_text),
                 images=image_inputs,
@@ -497,7 +494,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             if self.max_prompt_length is not None:
                 shuffled_prompt_ids = shuffled_prompt_ids[:, -self.max_prompt_length :]
                 shuffled_prompt_mask = shuffled_prompt_mask[:, -self.max_prompt_length :]
-            '''
+            
         
         # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
@@ -515,7 +512,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     shuffled_prompt_length = shuffled_prompt_ids.size(1)
                     shuffled_prompt_ids = shuffled_prompt_completion_ids[:, :shuffled_prompt_length]
                     shuffled_completion_ids = shuffled_prompt_completion_ids[:, shuffled_prompt_length:]
-                    shuffled_prompt_mask = prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
+                    shuffled_prompt_mask = shuffled_prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
                     
                 else:
                     
