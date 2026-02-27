@@ -1,77 +1,164 @@
 # USYD Capstone: Video-R1 T-GRPO Upgrade DevLog
 
 ## Core Objective
+
 Enhance the Video-R1 baseline T-GRPO training pipeline for video temporal reasoning by:
-1) introducing multi-corruption temporal destruction (Task A), and
-2) replacing the binary/threshold temporal reward with a marginal reward signal (Task B),
-with clear reproducibility notes and evaluation plans.
+
+1. introducing multi-corruption temporal destruction (Task A), and
+2. replacing the binary/threshold temporal reward with a marginal reward signal (Task B),
+   with clear reproducibility notes and evaluation plans.
 
 ---
 
 ## Project Timeline & TODO List
 
 ### Phase 1: Environment Setup & Baseline (Complete)
-- [x] Configure AutoDL server environment (Python 3.11, Conda video-r1).
-- [x] Download base weights: Qwen2.5-VL-7B-COT-SFT.
-- [x] Initialize private GitHub repo and configure .gitignore.
-- [x] **Infrastructure Troubleshooting & Optimization (New)**
+
+* [x] Configure AutoDL server environment (Python 3.11, Conda `video-r1`).
+* [x] Download base weights: `Qwen2.5-VL-7B-COT-SFT`.
+* [x] Initialize private GitHub repo and configure `.gitignore`.
+* [x] **Infrastructure troubleshooting and dependency stabilization**
 
 ---
 
 ### Phase 1.1: Infrastructure Lessons Learned (Troubleshooting)
 
-#### 1.1.1 Compilation Bottlenecks & CPU Utilization
-* **Issue**: Observed extreme compilation times (6+ hours) for FlashAttention-2.
-* **Root Cause**: The compilation command was restricted to `--threads 4`, utilizing only 25% of the available 16 vCPU Xeon Gold 6430 resources.
-* **Fix**: For future setups, match parallelism to hardware by setting `export MAX_JOBS=14` to fully leverage the 16-core architecture while leaving overhead for system I/O.
+#### 1.1.1 FlashAttention Build Instability and Long Compile Time
 
-#### 1.1.2 C++ ABI & Undefined Symbol Errors
-* **Issue**: Encountered `ImportError: undefined symbol` when importing `flash_attn` post-compilation.
-* **Root Cause**: Version mismatch between the Python 3.11 build environment and the system's default Python 3.12/PyTorch 2.5 symbols, causing C++ ABI incompatibility in the generated `.so` files.
-* **Fix**: Prioritize using pre-built `.whl` files (e.g., matching CUDA 12.4 + Torch 2.5) to avoid unstable source builds and ensure correct symbol linking.
+* **Issue**: FlashAttention-2 source installation took several hours and was unstable across repeated attempts.
+* **Observation**: Increasing compilation parallelism (`MAX_JOBS=14`) did speed up worker scheduling, but aggressive parallel build settings caused the CUDA compilation process to be killed during kernel compilation.
+* **Root Cause**: Source compilation of FlashAttention is expensive and memory-intensive. On the AutoDL node, high parallelism improved CPU usage but exceeded practical memory headroom, leading to `Killed` errors during `nvcc` execution.
+* **Fix**:
 
-#### 1.1.3 Network Acceleration
-* **Issue**: Extremely slow GitHub clone/download speeds on internal server networks.
-* **Fix**: Always initialize the terminal with `source /etc/network_turbo` to bypass bandwidth restrictions when fetching remote repositories or large model weights.
+  * Treat source compilation as a fallback option only.
+  * Prefer a **prebuilt wheel** matched to the active environment.
+  * If source build is unavoidable, reduce compile parallelism (e.g. `MAX_JOBS=2~4`) instead of maximizing CPU workers.
+
+#### 1.1.2 C++ ABI / Binary Compatibility Mismatch
+
+* **Issue**: Importing `flash_attn` failed with an `undefined symbol` error after installation.
+* **Root Cause**: The installed FlashAttention binary was not aligned with the active PyTorch/CUDA ABI combination in the `video-r1` environment. The environment used:
+
+  * Python 3.11
+  * PyTorch `2.5.1+cu124`
+  * `GLIBCXX_USE_CXX11_ABI = False`
+
+  This meant that an incompatible prebuilt artifact or stale compiled `.so` file had been loaded.
+* **Fix**:
+
+  * Verified the active PyTorch ABI using:
+
+    * `torch.__version__`
+    * `torch.version.cuda`
+    * `torch._C._GLIBCXX_USE_CXX11_ABI`
+  * Switched to the **official FlashAttention wheel** matching:
+
+    * CUDA 12
+    * Torch 2.5
+    * CPython 3.11
+    * `cxx11abiFALSE`
+  * Installed the wheel directly with `pip install --no-deps <wheel_path>` to avoid rebuilding and eliminate ABI mismatch.
+
+#### 1.1.3 Correct Environment Isolation
+
+* **Issue**: Package installation risked landing in the wrong Conda environment during repeated debugging.
+* **Root Cause**: AutoDL shells can default to `base`, while project runtime depended on the `video-r1` Conda environment.
+* **Fix**:
+
+  * Explicitly activated `conda activate video-r1` before all dependency operations.
+  * Verified the active interpreter path using:
+
+    * `which python`
+    * `python -c "import sys; print(sys.executable)"`
+  * Performed all FlashAttention / DeepSpeed / Torch checks only inside `video-r1`.
+
+#### 1.1.4 Network and Artifact Download Strategy
+
+* **Issue**: Downloading large binary dependencies directly from GitHub Releases was extremely slow on the training node.
+* **Root Cause**: PyPI mirror acceleration does not speed up GitHub Release asset downloads.
+* **Fix**:
+
+  * Used local/offline artifact transfer as a more reliable path for large wheels.
+  * Downloaded the required FlashAttention wheel externally and uploaded it to the AutoDL workspace.
+  * Installed from the local file path to avoid repeated failed or throttled remote downloads.
+
+#### 1.1.5 Final Dependency Resolution Outcome
+
+* **Resolved Strategy**:
+
+  * **Do not rely on repeated FlashAttention source compilation**
+  * **Use a version-matched prebuilt wheel whenever possible**
+  * Keep source build only as a backup path, with conservative parallelism and strict environment checks
 
 ---
 
-### Phase 2: Core Algorithm Modification — grpo_trainer.py (In Progress)
+### Phase 2: Core Algorithm Modification — `grpo_trainer.py` (In Progress)
 
 #### 2.1 Code Navigation & Baseline Understanding
-- [x] Located temporal corruption / shuffled video pipeline around ~line 330.
-- [x] Located temporal reward logic (original binary/threshold gating) around ~line 530.
-- [x] Confirmed the trainer computes reward for normal video vs corrupted video to enforce temporal reasoning behavior.
+
+* [x] Located temporal corruption / shuffled video pipeline around ~line 330.
+* [x] Located temporal reward logic (original binary/threshold gating) around ~line 530.
+* [x] Confirmed the trainer computes reward for normal video vs corrupted video to enforce temporal reasoning behavior.
 
 #### 2.2 Task A — Multi-Corruption Temporal Destruction (Done, minimal runnable)
-- [x] Implemented multi-corruption selection for temporal destruction:
-  - shuffle: random frame permutation
-  - reverse: reverse time order
-  - mask: frame masking (baseline implementation; may revise to temporal-drop/chunk-mask later)
-- [x] Fixed a critical bug: removed unintended baseline shuffle overwrite so that the selected corruption is actually used.
-- [x] Ensured corrupted-video prompts are constructed correctly via processing_class(..., videos=shuffled_video_inputs).
+
+* [x] Implemented multi-corruption selection for temporal destruction:
+
+  * shuffle: random frame permutation
+  * reverse: reverse time order
+  * mask: frame masking (baseline implementation; may revise to temporal-drop/chunk-mask later)
+* [x] Fixed a critical bug: removed unintended baseline shuffle overwrite so that the selected corruption is actually used.
+* [x] Ensured corrupted-video prompts are constructed correctly via `processing_class(..., videos=shuffled_video_inputs)`.
 
 #### 2.3 Task B — Marginal Reward (Done, minimal runnable; not per-sample yet)
-- [x] Replaced binary/threshold temporal reward with a margin-based reward boost computed from the performance gap between normal and corrupted videos.
-- [x] Kept reward change minimal to preserve training stability and enable end-to-end pipeline execution first.
+
+* [x] Replaced binary/threshold temporal reward with a margin-based reward boost computed from the performance gap between normal and corrupted videos.
+* [x] Kept reward change minimal to preserve training stability and enable end-to-end pipeline execution first.
 
 ---
 
 ### Phase 3: Smoke Test, Training, and Evaluation (Next)
-- [ ] Run syntax + pipeline smoke tests.
-- [ ] Full RL training on multi-GPU node(s) with DeepSpeed 0.18.6 and FlashAttention-2.
-- [ ] Ablation study plan:
-  - baseline (single shuffle + binary reward)
-  - Task A only
-  - Task B only
-  - Task A + Task B
-- [ ] Produce final deliverables: report, reproducible commands, and recorded knowledge transfer session.
+
+* [ ] Run syntax + dependency smoke tests.
+* [ ] Validate FlashAttention / DeepSpeed runtime integration on the target multi-GPU node.
+* [ ] Full RL training with DeepSpeed and stable environment lockfile / package notes.
+* [ ] Ablation study plan:
+
+  * baseline (single shuffle + binary reward)
+  * Task A only
+  * Task B only
+  * Task A + Task B
+* [ ] Produce final deliverables: report, reproducible commands, and recorded knowledge transfer session.
+
+---
+
+## Reproducibility Notes
+
+### Confirmed Runtime Environment
+
+* Python: 3.11
+* PyTorch: `2.5.1+cu124`
+* CUDA runtime in PyTorch: 12.4
+* GPU: NVIDIA GeForce RTX 4090
+* FlashAttention installation strategy: **prebuilt wheel matched to Torch/CUDA ABI**
+* Conda environment: `video-r1`
+
+### Practical Setup Lessons
+
+* Always verify the active Conda environment before installing performance-critical libraries.
+* For FlashAttention, **binary compatibility matters more than raw compile speed**.
+* High compile parallelism can reduce wall-clock time but may fail under limited memory.
+* Local wheel installation is often more reliable than repeated source rebuilds on cloud GPU nodes.
 
 ---
 
 ## Current Branch & Commits
-- Working branch: feat/marginal-reward-upgrade
-- Next commit(s) plan:
-  1) “Task A pipeline fix + multi-corruption”
-  2) “Task B marginal reward (batch-level)”
-  3) “Task B per-sample margin + logging by corruption type”
+
+* Working branch: `feat/marginal-reward-upgrade`
+
+### Next commit(s) plan
+
+1. `Task A pipeline fix + multi-corruption`
+2. `Task B marginal reward (batch-level)`
+3. `Environment stabilization notes + FlashAttention reproducibility`
+4. `Task B per-sample margin + logging by corruption type`
