@@ -452,10 +452,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-            
+
+        # Initialize destruction_type so it is always defined for metrics logging
+        destruction_type = None
+
         if self.temporal and video_inputs:
             # [Task A] Multiple Destruction Mechanism: Shuffle, Reverse, or Masking
-            import random
             num_frames = video_inputs[0].size(0)
             destruction_type = random.choice(["shuffle", "reverse", "mask"])
 
@@ -632,25 +634,34 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
-            
-            acc_mean = temporal_rewards_per_func[:, 0].mean()
-            shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
 
-            # [Task B] Marginal Reward System: Replacing Binary Logic with a Gradient Reward
-            # Calculation: Margin = (Normal_Acc - Destroyed_Acc) / Normal_Acc
-            # This captures how much the model relies on the correct temporal sequence.
-            
-            margin = (acc_mean - shuffled_acc_mean) / (acc_mean + 1e-6)
-            
-            # Marginal Boost: Scale the margin (e.g., 0.5) and ensure it is non-negative
-            marginal_boost = torch.clamp(margin, min=0.0) * 0.5
-            
-            # Apply the dynamic boost to rewards exceeding the threshold (0.1)
-            mask = temporal_rewards_per_func[:, 0] > 0.1
-            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + marginal_boost
-            
-            # Assign for metrics logging
-            temporal_rewards = torch.tensor([marginal_boost.item()]).to(device)
+            # [Task B] Per-Sample Marginal Reward: compute margin independently for each sample
+            # Replaces the batch-level scalar with a per-sample marginal boost vector.
+            batch_size = len(inputs)
+
+            # acc per sample: mean over each sample's G normal-video generations
+            acc_per_sample = temporal_rewards_per_func[:, 0].view(batch_size, self.num_generations).mean(dim=1)
+
+            # shuffled acc per sample: mean over each sample's shuffled_G corrupted-video generations
+            shuffled_acc_per_sample = shuffled_rewards_per_func[:, 0].view(
+                batch_size, self.shuffled_num_generations
+            ).mean(dim=1)
+
+            # Margin = (Normal_Acc - Destroyed_Acc) / Normal_Acc, clamped to [0, 1], scaled by 0.5
+            margin_per_sample = (acc_per_sample - shuffled_acc_per_sample) / (acc_per_sample + 1e-6)
+            marginal_boost_per_sample = torch.clamp(margin_per_sample, min=0.0, max=1.0) * 0.5
+
+            # Expand per-sample boost to match each individual generation
+            marginal_boost_expanded = marginal_boost_per_sample.repeat_interleave(self.num_generations)
+
+            # Apply the dynamic boost only to generations whose accuracy exceeds the threshold (0.1)
+            boost_mask = temporal_rewards_per_func[:, 0] > 0.1
+            temporal_rewards_per_func[boost_mask, 0] = (
+                temporal_rewards_per_func[boost_mask, 0] + marginal_boost_expanded[boost_mask]
+            )
+
+            # Assign for metrics logging (mean marginal boost across samples)
+            temporal_rewards = marginal_boost_per_sample.mean().unsqueeze(0).to(device)
 
             # [BASELINE - Commented out for comparison]
             # if acc_mean >= 0.8 * shuffled_acc_mean:
@@ -747,6 +758,10 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
             self._metrics["temporal_rewards"].append(self.accelerator.gather_for_metrics(temporal_rewards_list).mean().item())
+            # Log which corruption type was applied this step
+            if destruction_type is not None:
+                for dtype in ("shuffle", "reverse", "mask"):
+                    self._metrics[f"corruption/{dtype}"].append(1.0 if destruction_type == dtype else 0.0)
         
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 

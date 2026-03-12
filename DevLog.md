@@ -110,16 +110,18 @@ Enhance the Video-R1 baseline T-GRPO training pipeline for video temporal reason
 * [x] Fixed a critical bug: removed unintended baseline shuffle overwrite so that the selected corruption is actually used.
 * [x] Ensured corrupted-video prompts are constructed correctly via `processing_class(..., videos=shuffled_video_inputs)`.
 
-#### 2.3 Task B — Marginal Reward (Done, minimal runnable; not per-sample yet)
+#### 2.3 Task B — Marginal Reward (Done; per-sample margin implemented)
 
 * [x] Replaced binary/threshold temporal reward with a margin-based reward boost computed from the performance gap between normal and corrupted videos.
 * [x] Kept reward change minimal to preserve training stability and enable end-to-end pipeline execution first.
+* [x] Upgraded from batch-level scalar margin to **per-sample marginal reward**: each sample's margin is computed independently using its own G normal-video generations vs its shuffled_G corrupted-video generations.
+* [x] Added **corruption type logging** to training metrics (`corruption/shuffle`, `corruption/reverse`, `corruption/mask`), enabling per-step tracking of which destruction method was applied.
 
 ---
 
 ### Phase 3: Smoke Test, Training, and Evaluation (Next)
 
-* [ ] Run syntax + dependency smoke tests.
+* [x] Run syntax + dependency smoke tests (syntax verified: `grpo_trainer.py` passes `ast.parse`).
 * [ ] Validate FlashAttention / DeepSpeed runtime integration on the target multi-GPU node.
 * [ ] Full RL training with DeepSpeed and stable environment lockfile / package notes.
 * [ ] Ablation study plan:
@@ -158,7 +160,7 @@ Enhance the Video-R1 baseline T-GRPO training pipeline for video temporal reason
 
 ### Next commit(s) plan
 
-1. `Task A pipeline fix + multi-corruption`
-2. `Task B marginal reward (batch-level)`
-3. `Environment stabilization notes + FlashAttention reproducibility`
-4. `Task B per-sample margin + logging by corruption type`
+1. `Task A pipeline fix + multi-corruption` ✓
+2. `Task B marginal reward (batch-level)` ✓
+3. `Environment stabilization notes + FlashAttention reproducibility` ✓
+4. `Task B per-sample margin + logging by corruption type` ✓
