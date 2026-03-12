@@ -60,6 +60,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=True,
         metadata={"help": "whether using length reward"},
     )
+    multi_corruption: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Task A: use multi-corruption (shuffle/reverse/mask) instead of single shuffle"},
+    )
+    marginal_reward: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Task B: use marginal reward instead of binary temporal reward"},
+    )
 
 
 
