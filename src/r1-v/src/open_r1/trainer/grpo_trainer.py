@@ -288,6 +288,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.temporal = script_args.temporal
+        self.corruption_strength = script_args.corruption_strength
+        self.curriculum_learning = script_args.curriculum_learning
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
@@ -296,7 +298,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             num_return_sequences=self.num_generations,
             pad_token_id=pad_token_id,
         )
-        self.shuffled_num_generations = self.num_generations // 2
+        self.shuffled_num_generations = self.num_generations
         self.shuffled_generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
@@ -451,31 +453,42 @@ class Qwen2VLGRPOTrainer(Trainer):
         
             
         if self.temporal and video_inputs:
-            # [Task A] Multiple Destruction Mechanism: Shuffle, Reverse, or Masking
-            import random
             num_frames = video_inputs[0].size(0)
             destruction_type = random.choice(["shuffle", "reverse", "mask"])
 
+            # Curriculum learning: strength increases from 0.3 to 1.0 over training
+            if self.curriculum_learning:
+                progress = self.state.global_step / max(self.state.max_steps, 1)
+                stength = 0.3 + 0.7 * progress
+            else:
+                strength = self.corruption_strength
+            
+            num_to_corrupt = max(1, int(num_frames * strength))
+
             if destruction_type == "shuffle":
                 # 1. Temporal Shuffle (Baseline approach)
-                indices = torch.randperm(num_frames)
-                shuffled_video_inputs = [video_inputs[0][indices]]
+                indices = list(range(num_frames))
+                subset = random.sample(range(num_frames), num_to_corrupt)
+                shuffled_subset = subset.copy()
+                random.shuffle(shuffled_subset)
+                for orig, new in zip(subset, shuffled_subset):
+                    indices[orig] = new
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
             
             elif destruction_type == "reverse":
-                # 2. Temporal Reverse (Play video backward)
-                indices = torch.arange(num_frames - 1, -1, -1)
-                shuffled_video_inputs = [video_inputs[0][indices]]
+                # Partial reverse: reverse a contiguous chunk
+                start = random.randint(0, num_frames - num_to_corrupt)
+                indices = list(range(num_frames))
+                indices[start:start + num_to_corrupt] = reversed(indices[start:start + num_to_corrupt])
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
             
             else:
-                # 3. Frame Masking (Randomly black out 50% of the frames)
+                # Partial mask: black out a portion of frames
                 shuffled_video = video_inputs[0].clone()
-                mask_indices = torch.randperm(num_frames)[:max(1, num_frames // 2)]
-                shuffled_video[mask_indices] = 0.0  # Set pixel values to zero
+                mask_indices = torch.randperm(num_frames)[:num_to_corrupt]
+                shuffled_video[mask_indices] = 0.0
                 shuffled_video_inputs = [shuffled_video]
-            
-            # [BASELINE - Commented out for comparison]
-            # indices = torch.randperm(video_inputs[0].size(0))
-            # shuffled_video_inputs = [video_inputs[0][indices]]
+
 
             shuffled_prompt_inputs = self.processing_class(
                 text=copy.deepcopy(prompts_text),
@@ -629,36 +642,21 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
-            
-            acc_mean = temporal_rewards_per_func[:, 0].mean()
-            shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
 
-            # [Task B] Marginal Reward System: Replacing Binary Logic with a Gradient Reward
-            # Calculation: Margin = (Normal_Acc - Destroyed_Acc) / Normal_Acc
-            # This captures how much the model relies on the correct temporal sequence.
-            
-            margin = (acc_mean - shuffled_acc_mean) / (acc_mean + 1e-6)
-            
-            # Marginal Boost: Scale the margin (e.g., 0.5) and ensure it is non-negative
-            marginal_boost = torch.clamp(margin, min=0.0) * 0.5
-            
-            # Apply the dynamic boost to rewards exceeding the threshold (0.1)
+            # [P1] Per-generation margin: compare each generation pair independently
+            normal_acc = temporal_rewards_per_func[:, 0]     # shape: (num_generations,)
+            shuffled_acc = shuffled_rewards_per_func[:, 0]    # shape: (num_generations,) — now same size
+
+            # Each generation gets its own margin score
+            per_sample_margin = (normal_acc - shuffled_acc) / (normal_acc + 1e-6)
+            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * 0.5
+
+            # Only boost generations that actually got the answer right
             mask = temporal_rewards_per_func[:, 0] > 0.1
-            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + marginal_boost
-            
-            # Assign for metrics logging
-            temporal_rewards = torch.tensor([marginal_boost.item()]).to(device)
+            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + per_sample_boost[mask]
 
-            # [BASELINE - Commented out for comparison]
-            # if acc_mean >= 0.8 * shuffled_acc_mean:
-            #     mask = temporal_rewards_per_func[:, 0] > 0.1
-            #     temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
-            #     temporal_rewards = torch.tensor([1.0]).to('cuda')
-            # else:
-            #     temporal_rewards = torch.tensor([0.0]).to('cuda')
-        else:
-            # Default value for non-temporal or image-only samples
-            temporal_rewards = torch.tensor([0.5]).to(device)
+            # Log mean boost for metrics
+            temporal_rewards = torch.tensor([per_sample_boost.mean().item()]).to(device)
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:

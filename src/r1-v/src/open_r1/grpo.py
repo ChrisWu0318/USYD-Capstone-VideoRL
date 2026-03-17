@@ -61,6 +61,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=True,
         metadata={"help": "whether using length reward"},
     )
+    corruption_strength: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "corruption strength 0.0-1.0, controls how severely frames are disrupted"},
+    )
+    curriculum_learning: Optional[bool] = field(
+        default=False,
+        metadata={"help": "gradually increase corruption strength during training"},
+    )
 
 
 
