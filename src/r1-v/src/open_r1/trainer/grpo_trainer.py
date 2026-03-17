@@ -449,9 +449,6 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
             
         if self.temporal and video_inputs:
             # [Task A] Multiple Destruction Mechanism: Shuffle, Reverse, or Masking
@@ -746,7 +743,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
-            self._metrics["temporal_rewards"].append(self.accelerator.gather_for_metrics(temporal_rewards_list).mean().item())
+            self._metrics["temporal_rewards"].append(temporal_rewards_list).mean().item()
         
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 

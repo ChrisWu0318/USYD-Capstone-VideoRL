@@ -17,6 +17,7 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
+from webbrowser import get
 
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
@@ -139,13 +140,14 @@ def accuracy_reward(completions, solution, **kwargs):
                 score = compute_rouge_score(gt_ans, output_ans)
                 reward = max(0.0, min(1.0, score))
             elif question_type == "regression":
-                gt_number = normalize_number(gt_ans)
+                get_number = normalize_number(get_number)
                 out_number = normalize_number(output_ans)
-                if gt_number is None or out_number is None:
+                if get_number is None or out_number is None:
                     reward = 0.0
-                rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
-                rel_diff = min(1.0, max(0.0, rel_diff))
-                reward = 1 - rel_diff
+                else:
+                    rel_diff = (abs(out_number - get_number) + 1e-9) / (abs(get_number) + 1e-9)
+                    rel_diff = min(1.0, max(0.0, rel_diff))
+                    reward = 1 - rel_diff
             else:
                 reward = 0.0
         except Exception as e:
