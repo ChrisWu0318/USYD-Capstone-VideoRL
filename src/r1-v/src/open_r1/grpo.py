@@ -29,6 +29,7 @@ from datasets import Dataset, DatasetDict
 
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
+_rouge_scorer_instance = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
 
 
 @dataclass
@@ -117,8 +118,7 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
     def compute_rouge_score(reference, hypothesis, use_stemmer=True):
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=use_stemmer)
-        scores = scorer.score(reference, hypothesis)
+        scores = _rouge_scorer_instance.score(reference, hypothesis)
         average_fmeasure = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
         return average_fmeasure
     
@@ -137,17 +137,12 @@ def accuracy_reward(completions, solution, **kwargs):
             if question_type == "multiple choice":
                 reward = 1.0 if output_ans.strip() == gt_ans.strip() else 0.0
             elif question_type == "numerical":
-                gt_has_decimal = ("." in gt_ans) or ("," in gt_ans)
-                out_has_decimal = ("." in output_ans) or ("," in output_ans)
-                if gt_has_decimal != out_has_decimal:
+                gt_number = normalize_number(gt_ans)
+                out_number = normalize_number(output_ans)
+                if gt_number is None or out_number is None:
                     reward = 0.0
                 else:
-                    gt_number = normalize_number(gt_ans)
-                    out_number = normalize_number(output_ans)
-                    if gt_number is None or out_number is None:
-                        reward = 0.0
-                    else:
-                        reward = 1.0 if round(gt_number, 2) == round(out_number, 2) else 0.0
+                    reward = 1.0 if round(gt_number, 2) == round(out_number, 2) else 0.0
             elif question_type == "OCR":
                 error_rate = wer(gt_ans, output_ans)
                 reward = 1 - error_rate
@@ -184,10 +179,9 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    """Reward function that checks if the completion has a specific format."""
-    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+    matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 
