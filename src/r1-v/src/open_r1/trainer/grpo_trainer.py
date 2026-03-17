@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import os
+import logging
+logger = logging.getLogger(__name__)
+
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
@@ -290,6 +293,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.temporal = script_args.temporal
         self.corruption_strength = script_args.corruption_strength
         self.curriculum_learning = script_args.curriculum_learning
+        self.margin_scale = script_args.margin_scale
+        self.reward_threshold = script_args.reward_threshold
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
@@ -420,7 +425,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         try:
             image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
         except Exception as e:
-            print(f"process_vision_info error, using fixed data, {e}")
+            logger.warning(f"process_vision_info error, using fixed data, {e}")
             if inputs[0]['data_type'] == 'image':
                 input_copy[0]['content'][0]['image'] = os.getcwd() + "/Video-R1-data" + '/Math/Multimath-300k/17ff4c7d14c388134de02381b1fc2824.png'
             elif inputs[0]['data_type'] == 'video':
@@ -560,13 +565,12 @@ class Qwen2VLGRPOTrainer(Trainer):
                     shuffled_prompt_mask = shuffled_prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
                     
                 else:
-                    
-                    shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
+                    pass
 
         
-        print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
-        print('problem_id:', inputs[0]['problem_id'])       
-        print('prompt_length:', prompt_length)
+        logger.debug(f"path: {input_copy[0]['content'][0][inputs[0]['data_type']]}")
+        logger.debug(f"problem_id: {inputs[0]['problem_id']}")    
+        logger.debug(f"prompt_length: {prompt_length}")
                 
         
         
@@ -603,13 +607,11 @@ class Qwen2VLGRPOTrainer(Trainer):
                 # prompt_inputs["second_per_grid_ts"] = torch.tensor(prompt_inputs["second_per_grid_ts"]).repeat(len(prompt_completion_ids), 1)
         
         
-        
-        
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         except Exception as e:
-            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
+            logger.warning(f"Error computing per_token_logps: {e}")
             # per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device, requires_grad=True)
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
         
@@ -622,7 +624,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
             except Exception as e:
-                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
+                logger.warning(f"Error computing ref_per_token_logps: {e}")
                 # ref_per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device)
                 with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
@@ -684,10 +686,10 @@ class Qwen2VLGRPOTrainer(Trainer):
 
             # Each generation gets its own margin score
             per_sample_margin = (normal_acc - shuffled_acc) / (normal_acc + 1e-6)
-            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * 0.5
+            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * self.margin_scale
 
             # Only boost generations that actually got the answer right
-            mask = temporal_rewards_per_func[:, 0] > 0.1
+            mask = temporal_rewards_per_func[:, 0] > self.reward_threshold
             temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + per_sample_boost[mask]
 
             # Log mean boost for metrics
@@ -703,7 +705,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.len_control:
             mem_rewards = [0] * self.num_generations
             mask = rewards_per_func[:, 0] > 0.1
-            lenth_list = completion_mask.sum(1)
+            length_list = completion_mask.sum(1)
             selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
             #             if len(selected_indices) > 1 and len(selected_indices) < self.num_generations:
             # if len(selected_indices) > 1:
@@ -720,11 +722,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                     
             if len(selected_indices) > 1:     
                 for idx in selected_indices:
-                    if 320 <= lenth_list[idx] <= 512:
+                    if 320 <= length_list[idx] <= 512:
                         rewards[idx] += 0.2
         
-        print(rewards)
-        print(completion_mask.sum(1))
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -763,13 +763,13 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         gathered_rewards = self.accelerator.gather_for_metrics(rewards)
         
-        num_devices = gathered_rewards.size(0) // self.num_generations 
-        rewards_per_device = gathered_rewards.view(num_devices, self.num_generations)
-        wrong_devices = (rewards_per_device <= 1).all(dim=1)
-        wrong_ratio = wrong_devices.sum().item() / num_devices
-        
-        correct_devices = (rewards_per_device >= 2).all(dim=1)
-        correct_ratio = correct_devices.sum().item() / num_devices
+        # Use accuracy reward (column 0) for all_wrong/all_correct
+        acc_per_device = self.accelerator.gather_for_metrics(rewards_per_func[:, 0]).view(-1, self.num_generations)
+        wrong_devices = (acc_per_device == 0).all(dim=1)
+        wrong_ratio = wrong_devices.sum().item() / acc_per_device.size(0)
+
+        correct_devices = (acc_per_device == 1).all(dim=1)
+        correct_ratio = correct_devices.sum().item() / acc_per_device.size(0)
         
         self._metrics["all_wrong"].append(wrong_ratio)
         self._metrics["all_correct"].append(correct_ratio)
