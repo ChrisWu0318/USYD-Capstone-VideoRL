@@ -454,18 +454,22 @@ class Qwen2VLGRPOTrainer(Trainer):
             
         if self.temporal and video_inputs:
             num_frames = video_inputs[0].size(0)
-            destruction_type = random.choice(["shuffle", "reverse", "mask"])
+
+            # weighted random selection of corrpution type
+            corruption_types = ["shuffle", "reverse", "mask", "chunk_swap", "speed", "loop"]
+            corruption_weights = [0.25, 0.2, 0.15, 0.2, 0.1, 0.1]
+            destruction_type = random.choices(corruption_types, weights=corruption_weights, k=1)[0]
 
             # Curriculum learning: strength increases from 0.3 to 1.0 over training
             if self.curriculum_learning:
                 progress = self.state.global_step / max(self.state.max_steps, 1)
-                stength = 0.3 + 0.7 * progress
+                strength = 0.3 + 0.7 * progress
             else:
                 strength = self.corruption_strength
             
             num_to_corrupt = max(1, int(num_frames * strength))
 
-            if destruction_type == "shuffle":
+            if destruction_type == "shuffle":   
                 # 1. Temporal Shuffle (Baseline approach)
                 indices = list(range(num_frames))
                 subset = random.sample(range(num_frames), num_to_corrupt)
@@ -481,14 +485,45 @@ class Qwen2VLGRPOTrainer(Trainer):
                 indices = list(range(num_frames))
                 indices[start:start + num_to_corrupt] = reversed(indices[start:start + num_to_corrupt])
                 shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
-            
-            else:
+
+            elif destruction_type == "mask":
                 # Partial mask: black out a portion of frames
                 shuffled_video = video_inputs[0].clone()
                 mask_indices = torch.randperm(num_frames)[:num_to_corrupt]
                 shuffled_video[mask_indices] = 0.0
                 shuffled_video_inputs = [shuffled_video]
 
+            elif destruction_type == "chunk_swap":
+                # Chunk swap: split into chunks then swap their order
+                num_chunks = max(2, int(4 * strength))  # 2-4 chunks based on strength
+                chunk_size = num_frames // num_chunks
+                chunks = list(range(num_chunks))
+                random.shuffle(chunks)
+                indices = []
+                for c in chunks:
+                    start = c * chunk_size
+                    end = start + chunk_size if c != num_chunks - 1 else num_frames
+                    indices.extend(range(start, end))
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
+
+            elif destruction_type == "speed":
+                # Speed perturbation: drop frames to simulate fast-forward
+                keep_count = max(2, num_frames - num_to_corrupt)
+                keep_indices = sorted(random.sample(range(num_frames), keep_count))
+                # Repeat last frame to maintain original length
+                while len(keep_indices) < num_frames:
+                    keep_indices.append(keep_indices[-1])
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(keep_indices)]]
+
+            else:
+                # Loop: repeat an early segment to overwrite later frames
+                loop_len = num_to_corrupt
+                shuffled_video = video_inputs[0].clone()
+                shuffled_video[-loop_len:] = shuffled_video[:loop_len]
+                shuffled_video_inputs = [shuffled_video]
+
+            # [1.4] Log which corruption type was used
+            self._current_destruction_type = destruction_type
 
             shuffled_prompt_inputs = self.processing_class(
                 text=copy.deepcopy(prompts_text),
