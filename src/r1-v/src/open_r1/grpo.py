@@ -69,6 +69,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=False,
         metadata={"help": "gradually increase corruption strength during training"},
     )
+    margin_scale: Optional[float] = field(
+        default=0.5,
+        metadata={"help": "scaling factor for marginal boost (0.0-1.0)"},
+    )
+    reward_threshold: Optional[float] = field(
+        default=0.1,
+        metadata={"help": "minimum accuracy to receive temporal boost"},
+    )
 
 
 

@@ -777,6 +777,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
             self._metrics["temporal_rewards"].append(temporal_rewards_list).mean().item()
+            if hasattr(self, '_current_destruction_type'):
+                self._metrics["destruction_type_" + self._current_destruction_type].append(1.0)
         
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 
