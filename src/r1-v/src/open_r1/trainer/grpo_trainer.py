@@ -585,7 +585,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Compute the KL divergence between the model and the reference model
         
-        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)  # 限制 x 的范围
+        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)  # Limit the range of x
         per_token_kl = torch.exp(x_clamped) - x_clamped - 1
         
         if self.temporal and video_inputs:
