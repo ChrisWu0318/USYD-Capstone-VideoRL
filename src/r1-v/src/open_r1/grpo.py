@@ -17,8 +17,6 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
-from webbrowser import get
-
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
@@ -151,12 +149,12 @@ def accuracy_reward(completions, solution, **kwargs):
                 score = compute_rouge_score(gt_ans, output_ans)
                 reward = max(0.0, min(1.0, score))
             elif question_type == "regression":
-                get_number = normalize_number(get_number)
+                gt_number = normalize_number(gt_ans)
                 out_number = normalize_number(output_ans)
-                if get_number is None or out_number is None:
+                if gt_number is None or out_number is None:
                     reward = 0.0
                 else:
-                    rel_diff = (abs(out_number - get_number) + 1e-9) / (abs(get_number) + 1e-9)
+                    rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
                     rel_diff = min(1.0, max(0.0, rel_diff))
                     reward = 1 - rel_diff
             else:
@@ -179,10 +177,28 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
+    """Layered format reward: full credit for correct structure, partial for partial compliance."""
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
-    return [1.0 if match else 0.0 for match in matches]
+    rewards = []
+    full_pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
+    for content in completion_contents:
+        if re.match(full_pattern, content, re.DOTALL):
+            # Perfect: <think>...</think><answer>...</answer> in correct order
+            reward = 1.0
+        elif re.search(r'<think>.+?</think>', content, re.DOTALL) and \
+             re.search(r'<answer>.+?</answer>', content, re.DOTALL):
+            # Both tags present but order wrong or extra content around them
+            reward = 0.5
+        elif re.search(r'<answer>.+?</answer>', content, re.DOTALL):
+            # Answer tag only, no think tag
+            reward = 0.3
+        elif re.search(r'<think>.+?</think>', content, re.DOTALL):
+            # Think tag only, no answer tag
+            reward = 0.1
+        else:
+            reward = 0.0
+        rewards.append(reward)
+    return rewards
 
 
 reward_funcs_registry = {

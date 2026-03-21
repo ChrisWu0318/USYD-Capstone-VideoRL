@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import math
 import logging
 logger = logging.getLogger(__name__)
 
@@ -465,10 +466,11 @@ class Qwen2VLGRPOTrainer(Trainer):
             corruption_weights = [0.25, 0.2, 0.15, 0.2, 0.1, 0.1]
             destruction_type = random.choices(corruption_types, weights=corruption_weights, k=1)[0]
 
-            # Curriculum learning: strength increases from 0.3 to 1.0 over training
+            # Curriculum learning: strength increases from 0.3 to 1.0 over training via S-curve
+            # Slow start → fast ramp in the middle → plateau, smoother than linear
             if self.curriculum_learning:
                 progress = self.state.global_step / max(self.state.max_steps, 1)
-                strength = 0.3 + 0.7 * progress
+                strength = 0.3 + 0.7 * (1.0 / (1.0 + math.exp(-10.0 * (progress - 0.5))))
             else:
                 strength = self.corruption_strength
             
@@ -492,10 +494,13 @@ class Qwen2VLGRPOTrainer(Trainer):
                 shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
 
             elif destruction_type == "mask":
-                # Partial mask: black out a portion of frames
+                # Gaussian noise injection: subtler than black frames, forces temporal reasoning
                 shuffled_video = video_inputs[0].clone()
-                mask_indices = torch.randperm(num_frames)[:num_to_corrupt]
-                shuffled_video[mask_indices] = 0.0
+                noise_indices = torch.randperm(num_frames)[:num_to_corrupt]
+                noise = torch.randn_like(shuffled_video[noise_indices]) * 0.3
+                shuffled_video[noise_indices] = torch.clamp(
+                    shuffled_video[noise_indices] + noise, 0.0, 1.0
+                )
                 shuffled_video_inputs = [shuffled_video]
 
             elif destruction_type == "chunk_swap":
@@ -680,20 +685,30 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
 
-            # [P1] Per-generation margin: compare each generation pair independently
-            normal_acc = temporal_rewards_per_func[:, 0]     # shape: (num_generations,)
-            shuffled_acc = shuffled_rewards_per_func[:, 0]    # shape: (num_generations,) — now same size
+            # Use group-level mean accuracy for stable margin estimation
+            normal_acc_per_gen = temporal_rewards_per_func[:, 0]       # (G,)
+            shuffled_acc_per_gen = shuffled_rewards_per_func[:, 0]     # (G,)
 
-            # Each generation gets its own margin score
-            per_sample_margin = (normal_acc - shuffled_acc) / (normal_acc + 1e-6)
-            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * self.margin_scale
+            normal_group_acc = normal_acc_per_gen.view(-1, self.num_generations).mean(dim=1)    # (1,)
+            shuffled_group_acc = shuffled_acc_per_gen.view(-1, self.num_generations).mean(dim=1)  # (1,)
 
-            # Only boost generations that actually got the answer right
-            mask = temporal_rewards_per_func[:, 0] > self.reward_threshold
-            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + per_sample_boost[mask]
+            # margin > 0: model relies on temporal order (good) → boost correct answers
+            # margin < 0: model does better on corrupted video (bad) → penalize wrong answers
+            margin = normal_group_acc - shuffled_group_acc  # (1,)
+            boost = torch.sqrt(torch.clamp(margin, min=0.0)) * self.margin_scale
+            penalty = torch.clamp(margin, max=0.0) * self.margin_scale * 0.3
+
+            # Broadcast back to generation dimension
+            boost = boost.repeat_interleave(self.num_generations)    # (G,)
+            penalty = penalty.repeat_interleave(self.num_generations)  # (G,)
+
+            # Correct answers get boost; wrong answers get penalty signal
+            correct_mask = temporal_rewards_per_func[:, 0] > self.reward_threshold
+            temporal_rewards_per_func[correct_mask, 0] = temporal_rewards_per_func[correct_mask, 0] + boost[correct_mask]
+            temporal_rewards_per_func[~correct_mask, 0] = temporal_rewards_per_func[~correct_mask, 0] + penalty[~correct_mask]
 
             # Log mean boost for metrics
-            temporal_rewards = torch.tensor([per_sample_boost.mean().item()]).to(device)
+            temporal_rewards = torch.tensor([boost.mean().item()]).to(device)
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:
@@ -703,27 +718,22 @@ class Qwen2VLGRPOTrainer(Trainer):
     
         
         if self.len_control:
-            mem_rewards = [0] * self.num_generations
-            mask = rewards_per_func[:, 0] > 0.1
             length_list = completion_mask.sum(1)
-            selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
-            #             if len(selected_indices) > 1 and len(selected_indices) < self.num_generations:
-            # if len(selected_indices) > 1:
-            #     selected_items = [(i, lenth_list[i]) for i in selected_indices]
-            #     sorted_items = sorted(selected_items, key=lambda x: x[1], reverse=True)
-            #     N = len(sorted_items)
-            #     for rank, (idx, length) in enumerate(sorted_items):
-            #         reward = 0.2 - 0.2 * (rank / N)
-            #         rewards[idx] += reward
-            #         mem_rewards[idx] = reward
-            # for idx in range(len(lenth_list)):
-            #     if lenth_list[idx] >= 512:
-            #         rewards[idx] -= 0.5
-                    
-            if len(selected_indices) > 1:     
-                for idx in selected_indices:
-                    if 320 <= length_list[idx] <= 512:
-                        rewards[idx] += 0.2
+            target_low, target_high = 320, 512
+            for idx in range(len(length_list)):
+                if rewards_per_func[idx, 0] > 0.1:  # only reward correct answers
+                    length = length_list[idx].item()
+                    if target_low <= length <= target_high:
+                        # Full reward in target range
+                        length_reward = 0.2
+                    elif length < target_low:
+                        # Quadratic ramp-up below target (reaches 0.2 at target_low)
+                        length_reward = 0.2 * (length / target_low) ** 2
+                    else:
+                        # Linear decay above target, capped at -0.1 penalty for very long outputs
+                        over = length - target_high
+                        length_reward = max(-0.1, 0.2 - 0.002 * over)
+                    rewards[idx] += length_reward
         
 
         # Compute grouped-wise rewards
@@ -776,7 +786,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
-            self._metrics["temporal_rewards"].append(temporal_rewards_list).mean().item()
+            self._metrics["temporal_rewards"].append(temporal_rewards_list.mean().item())
             if hasattr(self, '_current_destruction_type'):
                 self._metrics["destruction_type_" + self._current_destruction_type].append(1.0)
         
