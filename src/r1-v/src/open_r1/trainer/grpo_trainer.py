@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import os
+import logging
+logger = logging.getLogger(__name__)
+
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
@@ -288,6 +291,10 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
         self.temporal = script_args.temporal
+        self.corruption_strength = script_args.corruption_strength
+        self.curriculum_learning = script_args.curriculum_learning
+        self.margin_scale = script_args.margin_scale
+        self.reward_threshold = script_args.reward_threshold
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
@@ -296,7 +303,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             num_return_sequences=self.num_generations,
             pad_token_id=pad_token_id,
         )
-        self.shuffled_num_generations = self.num_generations // 2
+        self.shuffled_num_generations = self.num_generations
         self.shuffled_generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
@@ -418,7 +425,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         try:
             image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
         except Exception as e:
-            print(f"process_vision_info error, using fixed data, {e}")
+            logger.warning(f"process_vision_info error, using fixed data, {e}")
             if inputs[0]['data_type'] == 'image':
                 input_copy[0]['content'][0]['image'] = os.getcwd() + "/Video-R1-data" + '/Math/Multimath-300k/17ff4c7d14c388134de02381b1fc2824.png'
             elif inputs[0]['data_type'] == 'video':
@@ -449,13 +456,80 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         
-        if self.max_prompt_length is not None:
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
             
         if self.temporal and video_inputs:
-            indices = torch.randperm(video_inputs[0].size(0))
-            shuffled_video_inputs = [video_inputs[0][indices]]
+            num_frames = video_inputs[0].size(0)
+
+            # weighted random selection of corrpution type
+            corruption_types = ["shuffle", "reverse", "mask", "chunk_swap", "speed", "loop"]
+            corruption_weights = [0.25, 0.2, 0.15, 0.2, 0.1, 0.1]
+            destruction_type = random.choices(corruption_types, weights=corruption_weights, k=1)[0]
+
+            # Curriculum learning: strength increases from 0.3 to 1.0 over training
+            if self.curriculum_learning:
+                progress = self.state.global_step / max(self.state.max_steps, 1)
+                strength = 0.3 + 0.7 * progress
+            else:
+                strength = self.corruption_strength
+            
+            num_to_corrupt = max(1, int(num_frames * strength))
+
+            if destruction_type == "shuffle":   
+                # 1. Temporal Shuffle (Baseline approach)
+                indices = list(range(num_frames))
+                subset = random.sample(range(num_frames), num_to_corrupt)
+                shuffled_subset = subset.copy()
+                random.shuffle(shuffled_subset)
+                for orig, new in zip(subset, shuffled_subset):
+                    indices[orig] = new
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
+            
+            elif destruction_type == "reverse":
+                # Partial reverse: reverse a contiguous chunk
+                start = random.randint(0, num_frames - num_to_corrupt)
+                indices = list(range(num_frames))
+                indices[start:start + num_to_corrupt] = reversed(indices[start:start + num_to_corrupt])
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
+
+            elif destruction_type == "mask":
+                # Partial mask: black out a portion of frames
+                shuffled_video = video_inputs[0].clone()
+                mask_indices = torch.randperm(num_frames)[:num_to_corrupt]
+                shuffled_video[mask_indices] = 0.0
+                shuffled_video_inputs = [shuffled_video]
+
+            elif destruction_type == "chunk_swap":
+                # Chunk swap: split into chunks then swap their order
+                num_chunks = max(2, int(4 * strength))  # 2-4 chunks based on strength
+                chunk_size = num_frames // num_chunks
+                chunks = list(range(num_chunks))
+                random.shuffle(chunks)
+                indices = []
+                for c in chunks:
+                    start = c * chunk_size
+                    end = start + chunk_size if c != num_chunks - 1 else num_frames
+                    indices.extend(range(start, end))
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
+
+            elif destruction_type == "speed":
+                # Speed perturbation: drop frames to simulate fast-forward
+                keep_count = max(2, num_frames - num_to_corrupt)
+                keep_indices = sorted(random.sample(range(num_frames), keep_count))
+                # Repeat last frame to maintain original length
+                while len(keep_indices) < num_frames:
+                    keep_indices.append(keep_indices[-1])
+                shuffled_video_inputs = [video_inputs[0][torch.tensor(keep_indices)]]
+
+            else:
+                # Loop: repeat an early segment to overwrite later frames
+                loop_len = num_to_corrupt
+                shuffled_video = video_inputs[0].clone()
+                shuffled_video[-loop_len:] = shuffled_video[:loop_len].clone()
+                shuffled_video_inputs = [shuffled_video]
+
+            # [1.4] Log which corruption type was used
+            self._current_destruction_type = destruction_type
+
             shuffled_prompt_inputs = self.processing_class(
                 text=copy.deepcopy(prompts_text),
                 images=image_inputs,
@@ -470,7 +544,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             if self.max_prompt_length is not None:
                 shuffled_prompt_ids = shuffled_prompt_ids[:, -self.max_prompt_length :]
                 shuffled_prompt_mask = shuffled_prompt_mask[:, -self.max_prompt_length :]
-        
+            
         
         # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
@@ -488,16 +562,15 @@ class Qwen2VLGRPOTrainer(Trainer):
                     shuffled_prompt_length = shuffled_prompt_ids.size(1)
                     shuffled_prompt_ids = shuffled_prompt_completion_ids[:, :shuffled_prompt_length]
                     shuffled_completion_ids = shuffled_prompt_completion_ids[:, shuffled_prompt_length:]
-                    shuffled_prompt_mask = prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
+                    shuffled_prompt_mask = shuffled_prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
                     
                 else:
-                    
-                    shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
+                    pass
 
         
-        print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
-        print('problem_id:', inputs[0]['problem_id'])       
-        print('prompt_length:', prompt_length)
+        logger.debug(f"path: {input_copy[0]['content'][0][inputs[0]['data_type']]}")
+        logger.debug(f"problem_id: {inputs[0]['problem_id']}")    
+        logger.debug(f"prompt_length: {prompt_length}")
                 
         
         
@@ -534,13 +607,11 @@ class Qwen2VLGRPOTrainer(Trainer):
                 # prompt_inputs["second_per_grid_ts"] = torch.tensor(prompt_inputs["second_per_grid_ts"]).repeat(len(prompt_completion_ids), 1)
         
         
-        
-        
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         except Exception as e:
-            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
+            logger.warning(f"Error computing per_token_logps: {e}")
             # per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device, requires_grad=True)
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
         
@@ -553,7 +624,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
             except Exception as e:
-                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
+                logger.warning(f"Error computing ref_per_token_logps: {e}")
                 # ref_per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device)
                 with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
@@ -605,23 +676,24 @@ class Qwen2VLGRPOTrainer(Trainer):
             output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
             rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         
-
-        
         
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
-            
-            acc_mean = temporal_rewards_per_func[:, 0].mean()
-            shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
 
-            if acc_mean >= 0.8 * shuffled_acc_mean:
-                mask = temporal_rewards_per_func[:, 0] > 0.1
-                temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
-                temporal_rewards = torch.tensor([1.0]).to('cuda')
-            else:
-                temporal_rewards = torch.tensor([0.0]).to('cuda')
-        else:
-            temporal_rewards =  torch.tensor([0.5]).to('cuda')
+            # [P1] Per-generation margin: compare each generation pair independently
+            normal_acc = temporal_rewards_per_func[:, 0]     # shape: (num_generations,)
+            shuffled_acc = shuffled_rewards_per_func[:, 0]    # shape: (num_generations,) — now same size
+
+            # Each generation gets its own margin score
+            per_sample_margin = (normal_acc - shuffled_acc) / (normal_acc + 1e-6)
+            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * self.margin_scale
+
+            # Only boost generations that actually got the answer right
+            mask = temporal_rewards_per_func[:, 0] > self.reward_threshold
+            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + per_sample_boost[mask]
+
+            # Log mean boost for metrics
+            temporal_rewards = torch.tensor([per_sample_boost.mean().item()]).to(device)
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:
@@ -633,7 +705,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.len_control:
             mem_rewards = [0] * self.num_generations
             mask = rewards_per_func[:, 0] > 0.1
-            lenth_list = completion_mask.sum(1)
+            length_list = completion_mask.sum(1)
             selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
             #             if len(selected_indices) > 1 and len(selected_indices) < self.num_generations:
             # if len(selected_indices) > 1:
@@ -650,11 +722,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                     
             if len(selected_indices) > 1:     
                 for idx in selected_indices:
-                    if 320 <= lenth_list[idx] <= 512:
+                    if 320 <= length_list[idx] <= 512:
                         rewards[idx] += 0.2
         
-        print(rewards)
-        print(completion_mask.sum(1))
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -693,20 +763,22 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         gathered_rewards = self.accelerator.gather_for_metrics(rewards)
         
-        num_devices = gathered_rewards.size(0) // self.num_generations 
-        rewards_per_device = gathered_rewards.view(num_devices, self.num_generations)
-        wrong_devices = (rewards_per_device <= 1).all(dim=1)
-        wrong_ratio = wrong_devices.sum().item() / num_devices
-        
-        correct_devices = (rewards_per_device >= 2).all(dim=1)
-        correct_ratio = correct_devices.sum().item() / num_devices
+        # Use accuracy reward (column 0) for all_wrong/all_correct
+        acc_per_device = self.accelerator.gather_for_metrics(rewards_per_func[:, 0]).view(-1, self.num_generations)
+        wrong_devices = (acc_per_device == 0).all(dim=1)
+        wrong_ratio = wrong_devices.sum().item() / acc_per_device.size(0)
+
+        correct_devices = (acc_per_device == 1).all(dim=1)
+        correct_ratio = correct_devices.sum().item() / acc_per_device.size(0)
         
         self._metrics["all_wrong"].append(wrong_ratio)
         self._metrics["all_correct"].append(correct_ratio)
         
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
-            self._metrics["temporal_rewards"].append(self.accelerator.gather_for_metrics(temporal_rewards_list).mean().item())
+            self._metrics["temporal_rewards"].append(temporal_rewards_list.mean().item())
+            if hasattr(self, '_current_destruction_type'):
+                self._metrics["destruction_type_" + self._current_destruction_type].append(1.0)
         
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 
