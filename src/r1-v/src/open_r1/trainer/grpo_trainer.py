@@ -218,14 +218,23 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Reference model
         if is_deepspeed_zero3_enabled():
+            # [OOM-FIX] Load ref_model to CPU first to avoid the 14GB spike when
+            # from_pretrained places the full 7B model on one GPU before DeepSpeed
+            # shards it. Do NOT use device_map (incompatible with ZeRO-3).
+            # prepare_deepspeed() below will properly shard and manage it.
+            ref_init_kwargs = dict(model_init_kwargs)
+            ref_init_kwargs["low_cpu_mem_usage"] = False
+            ref_init_kwargs.pop("device_map", None)
+            ref_init_kwargs.pop("use_cache", None)
             if "Qwen2-VL" in model_id:
-                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
             elif "Qwen2.5-VL" in model_id:
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
             elif "Aria" in model_id:
-                self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+                self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
             else:
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
+            self.ref_model = self.ref_model.cpu()  # ensure CPU before DeepSpeed takes over
         elif peft_config is None:
             self.ref_model = create_reference_model(model)
         else:
@@ -587,6 +596,10 @@ class Qwen2VLGRPOTrainer(Trainer):
                     print(f"[D1] Error computing masked logps: {e}. Skipping causal reward this step.")
                     masked_per_token_logps = None
                 finally:
+                    # [OOM-FIX] Free masked activation memory before moving on
+                    del masked_inputs
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                     # [FIX-4] Restore training mode
                     model.train()
 
@@ -609,6 +622,14 @@ class Qwen2VLGRPOTrainer(Trainer):
         # NOT the D2 KL truncation. D2 truncation happens below at per_token_kl.clamp(max=kl_d_max).
         x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)
         per_token_kl = torch.exp(x_clamped) - x_clamped - 1
+
+        # [OOM-FIX] Free large intermediate tensors after KL is computed.
+        # Do NOT delete per_token_logps — it is needed later for:
+        #   1. D1 causal reward: log_P1 = (per_token_logps[i] * completion_mask[i]).sum()
+        #   2. Policy loss: per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+        del ref_per_token_logps, x_clamped
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # [D2] Token-level clipped KL: cap each token's KL at D_max
         if self.exp_config.enable_token_clipped_kl:
