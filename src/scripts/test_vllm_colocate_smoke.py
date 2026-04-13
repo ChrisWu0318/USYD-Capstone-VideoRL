@@ -1,16 +1,20 @@
 """
 vLLM Colocate 冒烟测试
 验证 vLLM sleep/wake 在 4x GPU 上能正常工作。
+
+关键：external_launcher 模式下，所有 rank 必须调用 llm.generate()
+且传入相同的 prompts（NCCL 前向同步需要所有 rank 参与）。
+
 用法: CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 test_vllm_colocate_smoke.py
 """
 import os
 import torch
 import time
+import torch.distributed as dist
 
 
 def main():
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = dist.get_rank() if dist.is_initialized() else int(os.environ.get("RANK", "0"))
     is_main = (rank == 0)
 
     if is_main:
@@ -20,13 +24,9 @@ def main():
     import vllm
     if is_main:
         print(f"[Rank {rank}] vLLM version: {vllm.__version__}")
-        ver_parts = vllm.__version__.split(".")
-        assert int(ver_parts[0]) >= 0 and int(ver_parts[1]) >= 8, \
-            f"vLLM {vllm.__version__} < 0.8.0, sleep/wake not available!"
 
     # Step 2: 初始化 vLLM LLM 引擎
-    # external_launcher 模式下，ALL ranks 必须都创建 LLM 对象
-    # rank 0 是 driver，其余 rank 是 worker
+    # external_launcher: ALL ranks create LLM, ALL ranks call generate
     from vllm import LLM, SamplingParams
 
     model_path = os.environ.get("MODEL_PATH", "./Qwen2.5-VL-7B-COT-SFT")
@@ -39,7 +39,6 @@ def main():
         print(f"[Rank {rank}]   TP: {tp}, gpu_mem_util: {gpu_mem_util}")
 
     t0 = time.time()
-    # ALL ranks create LLM - external_launcher uses torchrun's distributed env
     llm = LLM(
         model=model_path,
         tensor_parallel_size=tp,
@@ -55,23 +54,26 @@ def main():
     if is_main:
         print(f"[Rank {rank}] LLM engine initialized in {t1-t0:.1f}s")
 
-    # Step 3: 测试 wake_up（all ranks）
+    # Step 3: 测试 wake_up
     if is_main:
         print(f"[Rank {rank}] Testing wake_up()...")
     llm.wake_up()
     if is_main:
         print(f"[Rank {rank}] wake_up() OK")
 
-    # Step 4: 简单文本生成（只有 driver/rank0 调用 generate）
+    # Step 4: 文本生成
+    # 所有 rank 必须调用 generate 且传入相同的 prompts！
     sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
+    prompts = ["Hello, my name is"]
     if is_main:
         print(f"[Rank {rank}] Testing text generation...")
-        outputs = llm.generate(["Hello, my name is"], sampling_params=sampling_params)
+    outputs = llm.generate(prompts, sampling_params=sampling_params)
+    if is_main:
         for output in outputs:
             print(f"[Rank {rank}] Generated: {output.outputs[0].text[:80]}")
         print(f"[Rank {rank}] Text generation OK")
 
-    # Step 5: 测试 sleep（all ranks）
+    # Step 5: 测试 sleep
     if is_main:
         print(f"[Rank {rank}] Testing sleep()...")
     llm.sleep(level=1)
@@ -84,11 +86,13 @@ def main():
     llm.wake_up()
     if is_main:
         print(f"[Rank {rank}] Second wake_up() OK, generating again...")
-        outputs = llm.generate(["What is 2+2?"], sampling_params=sampling_params)
-        for output in outputs:
+    prompts2 = ["What is 2+2?"]
+    outputs2 = llm.generate(prompts2, sampling_params=sampling_params)
+    if is_main:
+        for output in outputs2:
             print(f"[Rank {rank}] Generated: {output.outputs[0].text[:80]}")
 
-    # Step 7: 最终 sleep（all ranks）
+    # Step 7: 最终 sleep
     llm.sleep(level=1)
     if is_main:
         print(f"[Rank {rank}] Final sleep() OK")

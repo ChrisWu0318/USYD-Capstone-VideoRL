@@ -679,22 +679,24 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "multi_modal_data": {mm_item[0]: mm_item[1]}
                 })
 
-            # Main process generates; others wait
+            # ALL ranks call generate (external_launcher requires all ranks
+            # to participate in NCCL forward pass). Only main process
+            # collects results; others pass same inputs but discard outputs.
+            sampling_params = copy.deepcopy(self._vllm_sampling_params)
+            sampling_params.n = self.num_generations
+            outputs = self._vllm_engine.generate(
+                all_multimodal_inputs,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
             if self.accelerator.is_main_process:
-                sampling_params = copy.deepcopy(self._vllm_sampling_params)
-                sampling_params.n = self.num_generations
-                outputs = self._vllm_engine.generate(
-                    all_multimodal_inputs,
-                    sampling_params=sampling_params,
-                    use_tqdm=False,
-                )
                 completion_ids_list = [
                     out.token_ids
                     for completion in outputs
                     for out in completion.outputs
                 ]
             else:
-                completion_ids_list = [None] * len(all_multimodal_inputs) * self.num_generations
+                completion_ids_list = None
 
             # Broadcast and slice per-process
             from accelerate.utils import broadcast_object_list
@@ -731,7 +733,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                         "multi_modal_data": {mm_item[1]: mm_item[2]}
                     })
 
-                if self.accelerator.is_main_process and shuffled_all_multimodal_inputs:
+                # ALL ranks call generate for temporal (same reason: NCCL sync)
+                if shuffled_all_multimodal_inputs:
                     shuffled_sampling_params = copy.deepcopy(self._vllm_sampling_params)
                     shuffled_sampling_params.n = self.shuffled_num_generations
                     shuffled_outputs = self._vllm_engine.generate(
@@ -739,16 +742,16 @@ class Qwen2VLGRPOTrainer(Trainer):
                         sampling_params=shuffled_sampling_params,
                         use_tqdm=False,
                     )
-                    shuffled_completion_ids_list = [
-                        out.token_ids
-                        for completion in shuffled_outputs
-                        for out in completion.outputs
-                    ]
+                    if self.accelerator.is_main_process:
+                        shuffled_completion_ids_list = [
+                            out.token_ids
+                            for completion in shuffled_outputs
+                            for out in completion.outputs
+                        ]
+                    else:
+                        shuffled_completion_ids_list = None
                 else:
-                    shuffled_completion_ids_list = (
-                        [None] * len(shuffled_all_multimodal_inputs) * self.shuffled_num_generations
-                        if shuffled_all_multimodal_inputs else []
-                    )
+                    shuffled_completion_ids_list = []
 
                 if shuffled_all_multimodal_inputs:
                     shuffled_completion_ids_list = broadcast_object_list(
