@@ -64,6 +64,14 @@ class GRPOScriptArguments(ScriptArguments):
         default = None,
         metadata = {"help": "Path to experiment YAML config (e.g. configs/ablation_d2_kl.yaml)"}  # [FIX-1] metadate → metadata
     )
+    vllm_tensor_parallel_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "Tensor parallel size for vLLM in colocate mode. Should match number of training GPUs (e.g., 4 for 4x A100)."}
+    )
+    vllm_gpu_memory_utilization: Optional[float] = field(
+        default=0.3,
+        metadata={"help": "Fraction of GPU memory to allocate for vLLM KV cache in colocate mode. Remaining memory is used by ZeRO-3 training."}
+    )
 
 
 def accuracy_reward(completions, solution, **kwargs):
@@ -289,7 +297,9 @@ def main(script_args, training_args, model_args):
     dataset = dataset.map(make_conversation_image_and_video)
 
     
-    trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
+    # When use_vllm=True, Qwen2VLGRPOTrainer now supports vLLM colocate mode
+    # internally. The old server-mode Qwen2VLGRPOVLLMTrainerModified is deprecated.
+    trainer_cls = Qwen2VLGRPOTrainer
     print("using: ", trainer_cls)
 
     # Initialize the GRPO trainer

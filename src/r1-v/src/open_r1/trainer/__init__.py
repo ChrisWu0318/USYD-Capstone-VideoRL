@@ -3,5 +3,5 @@ from .vllm_grpo_trainer_modified import Qwen2VLGRPOVLLMTrainerModified
 
 __all__ = [
     "Qwen2VLGRPOTrainer", 
-    "Qwen2VLGRPOVLLMTrainerModified"
+    "Qwen2VLGRPOVLLMTrainerModified",  # deprecated: use Qwen2VLGRPOTrainer with --use_vllm
 ]
