@@ -17,7 +17,6 @@ import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
-from webbrowser import get
 
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
@@ -29,7 +28,6 @@ from datasets import Dataset, DatasetDict
 
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from rouge_score import rouge_scorer
-_rouge_scorer_instance = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
 
 
 @dataclass
@@ -62,23 +60,10 @@ class GRPOScriptArguments(ScriptArguments):
         default=True,
         metadata={"help": "whether using length reward"},
     )
-    corruption_strength: Optional[float] = field(
-        default=1.0,
-        metadata={"help": "corruption strength 0.0-1.0, controls how severely frames are disrupted"},
+    experiment_config: Optional[str] = field(
+        default = None,
+        metadata = {"help": "Path to experiment YAML config (e.g. configs/ablation_d2_kl.yaml)"}  # [FIX-1] metadate → metadata
     )
-    curriculum_learning: Optional[bool] = field(
-        default=False,
-        metadata={"help": "gradually increase corruption strength during training"},
-    )
-    margin_scale: Optional[float] = field(
-        default=0.5,
-        metadata={"help": "scaling factor for marginal boost (0.0-1.0)"},
-    )
-    reward_threshold: Optional[float] = field(
-        default=0.1,
-        metadata={"help": "minimum accuracy to receive temporal boost"},
-    )
-
 
 
 def accuracy_reward(completions, solution, **kwargs):
@@ -118,7 +103,8 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
     def compute_rouge_score(reference, hypothesis, use_stemmer=True):
-        scores = _rouge_scorer_instance.score(reference, hypothesis)
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=use_stemmer)
+        scores = scorer.score(reference, hypothesis)
         average_fmeasure = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
         return average_fmeasure
     
@@ -137,12 +123,17 @@ def accuracy_reward(completions, solution, **kwargs):
             if question_type == "multiple choice":
                 reward = 1.0 if output_ans.strip() == gt_ans.strip() else 0.0
             elif question_type == "numerical":
-                gt_number = normalize_number(gt_ans)
-                out_number = normalize_number(output_ans)
-                if gt_number is None or out_number is None:
+                gt_has_decimal = ("." in gt_ans) or ("," in gt_ans)
+                out_has_decimal = ("." in output_ans) or ("," in output_ans)
+                if gt_has_decimal != out_has_decimal:
                     reward = 0.0
                 else:
-                    reward = 1.0 if round(gt_number, 2) == round(out_number, 2) else 0.0
+                    gt_number = normalize_number(gt_ans)
+                    out_number = normalize_number(output_ans)
+                    if gt_number is None or out_number is None:
+                        reward = 0.0
+                    else:
+                        reward = 1.0 if round(gt_number, 2) == round(out_number, 2) else 0.0
             elif question_type == "OCR":
                 error_rate = wer(gt_ans, output_ans)
                 reward = 1 - error_rate
@@ -151,14 +142,16 @@ def accuracy_reward(completions, solution, **kwargs):
                 score = compute_rouge_score(gt_ans, output_ans)
                 reward = max(0.0, min(1.0, score))
             elif question_type == "regression":
-                get_number = normalize_number(get_number)
+                gt_number = normalize_number(gt_ans)
                 out_number = normalize_number(output_ans)
-                if get_number is None or out_number is None:
+                if gt_number is None or out_number is None:
                     reward = 0.0
                 else:
-                    rel_diff = (abs(out_number - get_number) + 1e-9) / (abs(get_number) + 1e-9)
+                    rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
                     rel_diff = min(1.0, max(0.0, rel_diff))
                     reward = 1 - rel_diff
+                # [FIX-2] 删除了原来在 if/else 外面的 3 行重复代码, 那 3 行在
+                # gt_number=None 时会 TypeError crash
             else:
                 reward = 0.0
         except Exception as e:
@@ -179,9 +172,10 @@ def accuracy_reward(completions, solution, **kwargs):
 
 
 def format_reward(completions, **kwargs):
-    pattern = r"^\s*<think>.*?</think>\s*<answer>.*?</answer>\s*$"
+    """Reward function that checks if the completion has a specific format."""
+    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content, re.DOTALL) for content in completion_contents]
+    matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 

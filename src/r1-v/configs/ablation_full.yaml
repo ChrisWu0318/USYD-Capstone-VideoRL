@@ -1,0 +1,31 @@
+# 消融 Step 3: 全量三维正则化
+# 预期: 最优结果, 但需确认 D1+D2+D3 之间无负交互
+
+experiment_name: ablation_full
+experiment_tag: full-v1
+description: "Full 3D regularization: Causal Reward + Clipped KL + Length Penalty"
+seed: 42
+
+# 维度二: ON
+enable_token_clipped_kl: true
+kl_d_max: 5.0
+
+# 维度三: ON
+enable_length_penalty: true
+length_min_mcq: 50
+length_max_mcq: 256
+length_min_open: 200
+length_max_open: 600
+length_penalty_alpha: 0.001
+length_penalty_beta: 0.0005
+welford_sigma_prior: 100.0
+welford_k_prior: 50
+welford_warmup_steps: 50
+
+# 维度一: ON
+enable_causal_reward: true
+softplus_beta: 2.0
+causal_mask_ratio: 0.5
+causal_lazy_eval: true
+causal_reward_clip: 10.0
+causal_reward_scale: 0.5

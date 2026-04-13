@@ -1,0 +1,17 @@
+# 消融 Step 1: Baseline + 维度二 (Token-Clipped KL Penalty)
+# 预期: KL 曲线更健康, 避免单 token KL 爆炸拖垮整条序列
+
+experiment_name: ablation_d2_kl
+experiment_tag: d2-kl-v1
+description: "Baseline + Token-level clipped KL penalty (D_max=5.0)"
+seed: 42
+
+# 维度二: ON
+enable_token_clipped_kl: true
+kl_d_max: 5.0
+
+# 维度三: OFF
+enable_length_penalty: false
+
+# 维度一: OFF
+enable_causal_reward: false

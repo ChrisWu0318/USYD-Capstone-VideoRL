@@ -13,9 +13,6 @@
 # limitations under the License.
 
 import os
-import logging
-logger = logging.getLogger(__name__)
-
 import textwrap
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
@@ -51,6 +48,9 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from qwen_vl_utils import process_vision_info
+from experiment_config import ExperimentConfig, task_type_from_problem_type
+from welford import BayesianWelford
+from temporal_mask import build_temporal_frame_mask  # [FIX-3] 帧级部分 mask
 
 import copy
 
@@ -205,7 +205,6 @@ class Qwen2VLGRPOTrainer(Trainer):
                 model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             else:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
-                # model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -217,7 +216,6 @@ class Qwen2VLGRPOTrainer(Trainer):
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
-        #self.ref_model = None
         # Reference model
         if is_deepspeed_zero3_enabled():
             if "Qwen2-VL" in model_id:
@@ -228,13 +226,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                 self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             else:
                 self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
-                # self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
         elif peft_config is None:
-            # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
         else:
-            # If PEFT is used, the reference model is not needed since the adapter can be disabled
-            # to revert to the initial model.
             self.ref_model = None
 
         # Processing class
@@ -276,8 +270,6 @@ class Qwen2VLGRPOTrainer(Trainer):
                     reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
                 if reward_processing_class.pad_token_id is None:
                     reward_processing_class.pad_token = reward_processing_class.eos_token
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
                 reward_func.config.pad_token_id = reward_processing_class.pad_token_id
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
@@ -288,27 +280,23 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Training arguments
         self.max_prompt_length = args.max_prompt_length
-        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
-        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.max_completion_length = args.max_completion_length
+        self.num_generations = args.num_generations
         self.temporal = script_args.temporal
-        self.corruption_strength = script_args.corruption_strength
-        self.curriculum_learning = script_args.curriculum_learning
-        self.margin_scale = script_args.margin_scale
-        self.reward_threshold = script_args.reward_threshold
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
             top_p=0.95,  
-            temperature=1, # HACK
+            temperature=1,
             num_return_sequences=self.num_generations,
             pad_token_id=pad_token_id,
         )
-        self.shuffled_num_generations = self.num_generations
+        self.shuffled_num_generations = self.num_generations // 2
         self.shuffled_generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
             top_p=0.95,  
-            temperature=1, # HACK
+            temperature=1,
             num_return_sequences=self.shuffled_num_generations,
             pad_token_id=pad_token_id,
         )
@@ -317,19 +305,13 @@ class Qwen2VLGRPOTrainer(Trainer):
             max_new_tokens=1,
             do_sample=True,
             top_p=0.95,  
-            temperature=1, # HACK
+            temperature=1,
             num_return_sequences=1,
             pad_token_id=pad_token_id,
         )
         self.len_control = script_args.len_control
         self.beta = args.beta
 
-        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
-        # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
-        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
-        # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
-        # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
-        # This acts as a flag to indicate that the warning has already been issued.
         model.warnings_issued["estimate_tokens"] = True
 
         # Initialize the metrics
@@ -346,9 +328,6 @@ class Qwen2VLGRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
-        # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
-        # self.model_accepts_loss_kwargs to False to enable scaling.
         self.model_accepts_loss_kwargs = False
 
         if self.ref_model is not None:
@@ -361,20 +340,53 @@ class Qwen2VLGRPOTrainer(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+        # ---- Experiment Config (4D Regularization) ----
+        if script_args is not None and getattr(script_args, 'experiment_config', None):
+            self.exp_config = ExperimentConfig.from_yaml(script_args.experiment_config)
+        else:
+            self.exp_config = ExperimentConfig()  # default = baseline, all flags OFF
+
+        if self.exp_config.enable_length_penalty:
+            self.welford = BayesianWelford(
+                sigma_prior=self.exp_config.welford_sigma_prior,
+                k_prior=self.exp_config.welford_k_prior,
+            )
+        else:
+            self.welford = None
+
+        if self.accelerator.is_main_process:
+            print(self.exp_config.summary())
+
+    # ------------------------------------------------------------------ #
+    # [FIX-5] Welford checkpoint save / restore                          #
+    # ------------------------------------------------------------------ #
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """Save Welford state alongside the normal checkpoint."""
+        super()._save_checkpoint(model, trial, metrics=metrics)
+        if self.welford is not None and self.accelerator.is_main_process:
+            ckpt_dir = self._get_output_dir(trial)
+            welford_path = os.path.join(ckpt_dir, "welford_state.pt")
+            torch.save(self.welford.state_dict(), welford_path)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """Restore Welford state when resuming."""
+        super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        if self.welford is not None:
+            welford_path = os.path.join(resume_from_checkpoint, "welford_state.pt")
+            if os.path.isfile(welford_path):
+                state = torch.load(welford_path, map_location="cpu")
+                self.welford.load_state_dict(state)
+                if self.accelerator.is_main_process:
+                    print(f"[Welford] Restored state from {welford_path} "
+                          f"(count={self.welford.count}, mean={self.welford.mean:.1f})")
+
     def _set_signature_columns_if_needed(self):
-        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
-        # By default, this method sets `self._signature_columns` to the model's expected inputs.
-        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
-        # Instead, we set them to the columns expected by the `training_step` method, hence the override.
         if self._signature_columns is None:
             self._signature_columns = ["prompt"]
 
 
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(self, model, input_ids, **kwargs):
-        # logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V)
-        # import pdb
-        # pdb.set_trace()
         logits = model(input_ids, **kwargs).logits
         logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
         input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
@@ -425,7 +437,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         try:
             image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
         except Exception as e:
-            logger.warning(f"process_vision_info error, using fixed data, {e}")
+            print(f"process_vision_info error, using fixed data, {e}")
             if inputs[0]['data_type'] == 'image':
                 input_copy[0]['content'][0]['image'] = os.getcwd() + "/Video-R1-data" + '/Math/Multimath-300k/17ff4c7d14c388134de02381b1fc2824.png'
             elif inputs[0]['data_type'] == 'video':
@@ -455,81 +467,10 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
-        
             
         if self.temporal and video_inputs:
-            num_frames = video_inputs[0].size(0)
-
-            # weighted random selection of corrpution type
-            corruption_types = ["shuffle", "reverse", "mask", "chunk_swap", "speed", "loop"]
-            corruption_weights = [0.25, 0.2, 0.15, 0.2, 0.1, 0.1]
-            destruction_type = random.choices(corruption_types, weights=corruption_weights, k=1)[0]
-
-            # Curriculum learning: strength increases from 0.3 to 1.0 over training
-            if self.curriculum_learning:
-                progress = self.state.global_step / max(self.state.max_steps, 1)
-                strength = 0.3 + 0.7 * progress
-            else:
-                strength = self.corruption_strength
-            
-            num_to_corrupt = max(1, int(num_frames * strength))
-
-            if destruction_type == "shuffle":   
-                # 1. Temporal Shuffle (Baseline approach)
-                indices = list(range(num_frames))
-                subset = random.sample(range(num_frames), num_to_corrupt)
-                shuffled_subset = subset.copy()
-                random.shuffle(shuffled_subset)
-                for orig, new in zip(subset, shuffled_subset):
-                    indices[orig] = new
-                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
-            
-            elif destruction_type == "reverse":
-                # Partial reverse: reverse a contiguous chunk
-                start = random.randint(0, num_frames - num_to_corrupt)
-                indices = list(range(num_frames))
-                indices[start:start + num_to_corrupt] = reversed(indices[start:start + num_to_corrupt])
-                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
-
-            elif destruction_type == "mask":
-                # Partial mask: black out a portion of frames
-                shuffled_video = video_inputs[0].clone()
-                mask_indices = torch.randperm(num_frames)[:num_to_corrupt]
-                shuffled_video[mask_indices] = 0.0
-                shuffled_video_inputs = [shuffled_video]
-
-            elif destruction_type == "chunk_swap":
-                # Chunk swap: split into chunks then swap their order
-                num_chunks = max(2, int(4 * strength))  # 2-4 chunks based on strength
-                chunk_size = num_frames // num_chunks
-                chunks = list(range(num_chunks))
-                random.shuffle(chunks)
-                indices = []
-                for c in chunks:
-                    start = c * chunk_size
-                    end = start + chunk_size if c != num_chunks - 1 else num_frames
-                    indices.extend(range(start, end))
-                shuffled_video_inputs = [video_inputs[0][torch.tensor(indices)]]
-
-            elif destruction_type == "speed":
-                # Speed perturbation: drop frames to simulate fast-forward
-                keep_count = max(2, num_frames - num_to_corrupt)
-                keep_indices = sorted(random.sample(range(num_frames), keep_count))
-                # Repeat last frame to maintain original length
-                while len(keep_indices) < num_frames:
-                    keep_indices.append(keep_indices[-1])
-                shuffled_video_inputs = [video_inputs[0][torch.tensor(keep_indices)]]
-
-            else:
-                # Loop: repeat an early segment to overwrite later frames
-                loop_len = num_to_corrupt
-                shuffled_video = video_inputs[0].clone()
-                shuffled_video[-loop_len:] = shuffled_video[:loop_len]
-                shuffled_video_inputs = [shuffled_video]
-
-            # [1.4] Log which corruption type was used
-            self._current_destruction_type = destruction_type
-
+            indices = torch.randperm(video_inputs[0].size(0))
+            shuffled_video_inputs = [video_inputs[0][indices]]
             shuffled_prompt_inputs = self.processing_class(
                 text=copy.deepcopy(prompts_text),
                 images=image_inputs,
@@ -544,7 +485,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             if self.max_prompt_length is not None:
                 shuffled_prompt_ids = shuffled_prompt_ids[:, -self.max_prompt_length :]
                 shuffled_prompt_mask = shuffled_prompt_mask[:, -self.max_prompt_length :]
-            
+        
         
         # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
@@ -562,15 +503,17 @@ class Qwen2VLGRPOTrainer(Trainer):
                     shuffled_prompt_length = shuffled_prompt_ids.size(1)
                     shuffled_prompt_ids = shuffled_prompt_completion_ids[:, :shuffled_prompt_length]
                     shuffled_completion_ids = shuffled_prompt_completion_ids[:, shuffled_prompt_length:]
-                    shuffled_prompt_mask = shuffled_prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
+                    shuffled_prompt_mask = prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
                     
                 else:
-                    pass
+                    
+                    shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
 
-        
-        logger.debug(f"path: {input_copy[0]['content'][0][inputs[0]['data_type']]}")
-        logger.debug(f"problem_id: {inputs[0]['problem_id']}")    
-        logger.debug(f"prompt_length: {prompt_length}")
+        # [FIX-7] Debug prints gated behind DEBUG_MODE
+        if os.getenv("DEBUG_MODE") == "true":
+            print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
+            print('problem_id:', inputs[0]['problem_id'])       
+            print('prompt_length:', prompt_length)
                 
         
         
@@ -583,12 +526,6 @@ class Qwen2VLGRPOTrainer(Trainer):
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Concatenate prompt_mask with completion_mask for logit computation
-        # attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
-        # pixel_values = prompt_inputs["pixel_values"].repeat(self.num_generations, 1)
-        # image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
-        
-
         
         prompt_inputs.pop("input_ids")
         prompt_inputs.pop("attention_mask")
@@ -596,25 +533,63 @@ class Qwen2VLGRPOTrainer(Trainer):
         if inputs[0]['data_type'] == 'image':
             prompt_inputs["pixel_values"] = prompt_inputs["pixel_values"].repeat(len(prompt_completion_ids), 1)
             prompt_inputs["image_grid_thw"] = prompt_inputs["image_grid_thw"].repeat(len(prompt_completion_ids), 1)
-        # import pdb; pdb.set_trace()
-        
 
         if inputs[0]['data_type'] == 'video':
             prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(len(prompt_completion_ids), 1)
             prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
-            if 'second_per_grid_ts' in prompt_inputs: # this two lines could be deleted: https://github.com/tulerfeng/Video-R1/issues/73
+            if 'second_per_grid_ts' in prompt_inputs:
                 del prompt_inputs["second_per_grid_ts"]
-                # prompt_inputs["second_per_grid_ts"] = torch.tensor(prompt_inputs["second_per_grid_ts"]).repeat(len(prompt_completion_ids), 1)
+        
+        
         
         
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         except Exception as e:
-            logger.warning(f"Error computing per_token_logps: {e}")
-            # per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device, requires_grad=True)
+            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
         
+        # ============================================================== #
+        # [FIX-3] D1: partial temporal frame mask (was: full zero-out)   #
+        # [FIX-4] D1: model.eval() to disable dropout during causal     #
+        #         measurement, then restore model.train()                #
+        # ============================================================== #
+        masked_per_token_logps = None
+        if self.exp_config.enable_causal_reward and video_inputs:
+            with torch.no_grad():
+                masked_inputs = {}
+                for k, v in prompt_inputs.items():
+                    masked_inputs[k] = v.clone() if isinstance(v, torch.Tensor) else v
+
+                if "pixel_values_videos" in masked_inputs:
+                    # [FIX-3] Partial temporal frame mask via video_grid_thw
+                    masked_inputs["pixel_values_videos"] = build_temporal_frame_mask(
+                        pixel_values_videos=masked_inputs["pixel_values_videos"],
+                        video_grid_thw=masked_inputs["video_grid_thw"],
+                        mask_ratio=self.exp_config.causal_mask_ratio,
+                        num_generations=self.num_generations,
+                    )
+                elif "pixel_values" in masked_inputs:
+                    # Image: no temporal dim, fall back to full mask
+                    masked_inputs["pixel_values"] = torch.zeros_like(
+                        masked_inputs["pixel_values"]
+                    )
+
+                try:
+                    # [FIX-4] Switch to eval mode to disable dropout for clean comparison
+                    model.eval()
+                    masked_per_token_logps = self._get_per_token_logps(
+                        model, prompt_completion_ids, **masked_inputs
+                    )
+                    masked_per_token_logps = masked_per_token_logps[:, prompt_length - 1 :]
+                except Exception as e:
+                    print(f"[D1] Error computing masked logps: {e}. Skipping causal reward this step.")
+                    masked_per_token_logps = None
+                finally:
+                    # [FIX-4] Restore training mode
+                    model.train()
+
         with torch.inference_mode():
             try:
                 if self.ref_model is not None:
@@ -624,16 +599,22 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
             except Exception as e:
-                logger.warning(f"Error computing ref_per_token_logps: {e}")
-                # ref_per_token_logps = torch.tensor(0.0, device=prompt_completion_ids.device)
+                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
                 with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
 
         # Compute the KL divergence between the model and the reference model
-        
-        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)  # 限制 x 的范围
+        # [FIX-6] Note: x_clamped is the numerical-stability clamp (±10) on the log ratio,
+        # NOT the D2 KL truncation. D2 truncation happens below at per_token_kl.clamp(max=kl_d_max).
+        x_clamped = torch.clamp(ref_per_token_logps - per_token_logps, min=-10, max=10)
         per_token_kl = torch.exp(x_clamped) - x_clamped - 1
+
+        # [D2] Token-level clipped KL: cap each token's KL at D_max
+        if self.exp_config.enable_token_clipped_kl:
+            # [FIX-6] Save pre-clip KL for monitoring before D2 truncation modifies it
+            raw_per_token_kl = per_token_kl.detach().clone()
+            per_token_kl = per_token_kl.clamp(max=self.exp_config.kl_d_max)
         
         if self.temporal and video_inputs:
             shuffled_completions = self.processing_class.batch_decode(shuffled_completion_ids, skip_special_tokens=True)
@@ -646,11 +627,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             for i, (reward_func, reward_processing_class) in enumerate(
                 zip(self.reward_funcs, self.reward_processing_classes)
             ):
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 shuffled_reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                 for key in shuffled_reward_kwargs:
                     for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
                         shuffled_reward_kwargs[key].extend([example[key]] * self.shuffled_num_generations)
                 shuffled_output_reward_func = reward_func(prompts=shuffled_prompts, completions=shuffled_completions, **shuffled_reward_kwargs)
                 shuffled_rewards_per_func[:, i] = torch.tensor(shuffled_output_reward_func, dtype=torch.float32, device=device)
@@ -667,33 +646,30 @@ class Qwen2VLGRPOTrainer(Trainer):
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
-            # Repeat all input columns (but "prompt" and "completion") to match the number of generations
             reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
             for key in reward_kwargs:
                 for example in inputs:
-                    # Repeat each value in the column for `num_generations` times
                     reward_kwargs[key].extend([example[key]] * self.num_generations)
             output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
             rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         
+
+        
         
         if self.temporal and video_inputs:
             temporal_rewards_per_func = rewards_per_func.clone()
+            
+            acc_mean = temporal_rewards_per_func[:, 0].mean()
+            shuffled_acc_mean = shuffled_rewards_per_func[:, 0].mean()
 
-            # [P1] Per-generation margin: compare each generation pair independently
-            normal_acc = temporal_rewards_per_func[:, 0]     # shape: (num_generations,)
-            shuffled_acc = shuffled_rewards_per_func[:, 0]    # shape: (num_generations,) — now same size
-
-            # Each generation gets its own margin score
-            per_sample_margin = (normal_acc - shuffled_acc) / (normal_acc + 1e-6)
-            per_sample_boost = torch.clamp(per_sample_margin, min=0.0) * self.margin_scale
-
-            # Only boost generations that actually got the answer right
-            mask = temporal_rewards_per_func[:, 0] > self.reward_threshold
-            temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + per_sample_boost[mask]
-
-            # Log mean boost for metrics
-            temporal_rewards = torch.tensor([per_sample_boost.mean().item()]).to(device)
+            if acc_mean >= 0.8 * shuffled_acc_mean:
+                mask = temporal_rewards_per_func[:, 0] > 0.1
+                temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
+                temporal_rewards = torch.tensor([1.0]).to('cuda')
+            else:
+                temporal_rewards = torch.tensor([0.0]).to('cuda')
+        else:
+            temporal_rewards =  torch.tensor([0.5]).to('cuda')
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:
@@ -705,26 +681,68 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.len_control:
             mem_rewards = [0] * self.num_generations
             mask = rewards_per_func[:, 0] > 0.1
-            length_list = completion_mask.sum(1)
+            lenth_list = completion_mask.sum(1)
             selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
-            #             if len(selected_indices) > 1 and len(selected_indices) < self.num_generations:
-            # if len(selected_indices) > 1:
-            #     selected_items = [(i, lenth_list[i]) for i in selected_indices]
-            #     sorted_items = sorted(selected_items, key=lambda x: x[1], reverse=True)
-            #     N = len(sorted_items)
-            #     for rank, (idx, length) in enumerate(sorted_items):
-            #         reward = 0.2 - 0.2 * (rank / N)
-            #         rewards[idx] += reward
-            #         mem_rewards[idx] = reward
-            # for idx in range(len(lenth_list)):
-            #     if lenth_list[idx] >= 512:
-            #         rewards[idx] -= 0.5
                     
             if len(selected_indices) > 1:     
                 for idx in selected_indices:
-                    if 320 <= length_list[idx] <= 512:
+                    if 320 <= lenth_list[idx] <= 512:
                         rewards[idx] += 0.2
         
+        # [D1] Soft-Truncated Counterfactual Causal Reward
+        # For samples where accuracy_reward >= 1.0, measure how much the model
+        # relies on visual features by comparing log_P(Y|V,Q) vs log_P(Y|masked_V,Q)
+        causal_rewards = torch.zeros_like(rewards)
+        d1_num_evaluated = 0
+        d1_num_skipped = 0
+        if self.exp_config.enable_causal_reward and masked_per_token_logps is not None:
+            accuracy_rewards_col = rewards_per_func[:, 0]  # accuracy reward column
+            beta_s = self.exp_config.softplus_beta
+            for i in range(len(rewards)):
+                # Lazy evaluation: only compute for correct answers
+                if accuracy_rewards_col[i].item() < 1.0:
+                    d1_num_skipped += 1
+                    continue
+                d1_num_evaluated += 1
+                # log_P1: sum of completion token log probs with visual input
+                log_P1 = (per_token_logps[i].detach() * completion_mask[i]).sum()
+                # log_P2: sum of completion token log probs WITHOUT visual input
+                log_P2 = (masked_per_token_logps[i] * completion_mask[i]).sum()
+                # Softplus: smooth approximation of max(0, diff)
+                diff = log_P1 - log_P2
+                causal_rewards[i] = torch.nn.functional.softplus(diff * beta_s) / beta_s
+
+            # Clamp to prevent Advantage polarization from outliers
+            causal_rewards = causal_rewards.clamp(max=self.exp_config.causal_reward_clip)
+            rewards = rewards + causal_rewards * self.exp_config.causal_reward_scale
+
+        # [D3] Task-Conditioned Piecewise Length Penalty
+        # Penalize outputs that are too long or too short for their task type
+        length_penalties = torch.zeros_like(rewards)
+        if self.exp_config.enable_length_penalty and self.welford is not None:
+            completion_lengths = completion_mask.sum(dim=1)  # [batch * num_gen]
+            for i in range(len(rewards)):
+                # [FIX-8] Safe indexing: clamp sample_idx to valid range of inputs
+                sample_idx = min(i // self.num_generations, len(inputs) - 1)
+                problem_type = inputs[sample_idx].get('problem_type', '')
+                task = task_type_from_problem_type(problem_type) if problem_type else 'open_ended'
+                length = completion_lengths[i].item()
+
+                l_min, l_max = self.welford.get_dynamic_bounds(task, self.exp_config)
+
+                if length > l_max:
+                    length_penalties[i] = -self.exp_config.length_penalty_alpha * (length - l_max)
+                elif length < l_min:
+                    length_penalties[i] = -self.exp_config.length_penalty_beta * (l_min - length)
+
+            rewards = rewards + length_penalties
+            # Update Welford online statistics with this batch's lengths
+            self.welford.update_batch(completion_lengths.tolist())
+
+        # [FIX-7] Debug prints gated behind DEBUG_MODE (was: unconditional print)
+        if os.getenv("DEBUG_MODE") == "true":
+            print(rewards)
+            print(completion_mask.sum(1))
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -734,20 +752,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
-        
-        # if self.len_control and len(selected_indices) == self.num_generations:
-        #     for idx in range(len(rewards)):
-        #         advantages[idx] += (mem_rewards[idx] - 0.2) * 2
 
         # x - x.detach() allows for preserving gradients from x
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
-        # per_token_loss = -per_token_loss
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-       
-            
-        # import pdb
-        # pdb.set_trace()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
@@ -763,22 +772,20 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         gathered_rewards = self.accelerator.gather_for_metrics(rewards)
         
-        # Use accuracy reward (column 0) for all_wrong/all_correct
-        acc_per_device = self.accelerator.gather_for_metrics(rewards_per_func[:, 0]).view(-1, self.num_generations)
-        wrong_devices = (acc_per_device == 0).all(dim=1)
-        wrong_ratio = wrong_devices.sum().item() / acc_per_device.size(0)
-
-        correct_devices = (acc_per_device == 1).all(dim=1)
-        correct_ratio = correct_devices.sum().item() / acc_per_device.size(0)
+        num_devices = gathered_rewards.size(0) // self.num_generations 
+        rewards_per_device = gathered_rewards.view(num_devices, self.num_generations)
+        wrong_devices = (rewards_per_device <= 1).all(dim=1)
+        wrong_ratio = wrong_devices.sum().item() / num_devices
+        
+        correct_devices = (rewards_per_device >= 2).all(dim=1)
+        correct_ratio = correct_devices.sum().item() / num_devices
         
         self._metrics["all_wrong"].append(wrong_ratio)
         self._metrics["all_correct"].append(correct_ratio)
         
         if self.temporal:
             temporal_rewards_list = self.accelerator.gather_for_metrics(temporal_rewards)
-            self._metrics["temporal_rewards"].append(temporal_rewards_list).mean().item()
-            if hasattr(self, '_current_destruction_type'):
-                self._metrics["destruction_type_" + self._current_destruction_type].append(1.0)
+            self._metrics["temporal_rewards"].append(temporal_rewards_list.mean().item())
         
         self._metrics["reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
 
@@ -786,6 +793,32 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        # [D2] KL diagnostics: track truncation ratio when clipping is enabled
+        if self.exp_config.enable_token_clipped_kl:
+            # [FIX-6] Use the pre-clip snapshot saved earlier (raw_per_token_kl)
+            # instead of recomputing from x_clamped to avoid confusion
+            trunc_ratio = (raw_per_token_kl > self.exp_config.kl_d_max).float().mean()
+            self._metrics["kl_truncation_ratio"].append(trunc_ratio.item())
+            self._metrics["kl_raw_max"].append(raw_per_token_kl.max().item())
+
+        # [D1] Causal reward diagnostics
+        if self.exp_config.enable_causal_reward:
+            self._metrics["causal_reward_mean"].append(causal_rewards.mean().item())
+            self._metrics["causal_reward_max"].append(causal_rewards.max().item())
+            self._metrics["causal_reward_std"].append(causal_rewards.std().item())  # [FIX-3] track variance
+            total_d1 = d1_num_evaluated + d1_num_skipped
+            self._metrics["causal_eval_ratio"].append(
+                d1_num_evaluated / max(total_d1, 1)
+            )
+
+        # [D3] Length penalty diagnostics
+        if self.exp_config.enable_length_penalty:
+            self._metrics["length_penalty_mean"].append(length_penalties.mean().item())
+            nonzero_ratio = (length_penalties != 0).float().mean().item()
+            self._metrics["length_penalty_nonzero_ratio"].append(nonzero_ratio)
+            self._metrics["welford_mean"].append(self.welford.mean)
+            self._metrics["welford_std"].append(self.welford.std)
         
 
         return loss

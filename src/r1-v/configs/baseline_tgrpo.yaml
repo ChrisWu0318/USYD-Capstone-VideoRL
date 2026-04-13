@@ -1,0 +1,12 @@
+# Baseline T-GRPO: P0 bug 修复后的原始算法, 无任何创新维度
+# 用途: 消融实验的对照组
+
+experiment_name: baseline_tgrpo
+experiment_tag: baseline-v1
+description: "Original T-GRPO with P0 bug fixes only"
+seed: 42
+
+# 所有维度关闭
+enable_token_clipped_kl: false
+enable_length_penalty: false
+enable_causal_reward: false
