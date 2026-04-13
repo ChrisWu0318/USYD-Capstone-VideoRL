@@ -363,6 +363,18 @@ class Qwen2VLGRPOTrainer(Trainer):
         else:
             self.welford = None
 
+        # [FIX-9] Override len_control from experiment config if specified.
+        # When D3 (length_penalty) is ON, the original hardcoded len_control
+        # (320-512 range, +0.2 bonus) must be OFF to avoid double-penalty.
+        if self.exp_config.override_len_control is not None:
+            if self.len_control != self.exp_config.override_len_control:
+                print(
+                    f"[FIX-9] Experiment config overrides --len_control from {self.len_control} "
+                    f"to {self.exp_config.override_len_control} "
+                    f"(experiment: {self.exp_config.experiment_name})"
+                )
+                self.len_control = self.exp_config.override_len_control
+
         if self.accelerator.is_main_process:
             print(self.exp_config.summary())
 
