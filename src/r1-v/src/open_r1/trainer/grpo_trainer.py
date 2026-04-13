@@ -463,6 +463,7 @@ class Qwen2VLGRPOTrainer(Trainer):
             dtype=torch.bfloat16,
             enforce_eager=True,  # disable CUDA graphs for sleep/wake compatibility
             enable_prefix_caching=True,
+            seed=42,  # required by external_launcher for reproducible sampling
             max_model_len=self.max_prompt_length + self.max_completion_length,
             mm_processor_kwargs={
                 "max_pixels": max_pixels,

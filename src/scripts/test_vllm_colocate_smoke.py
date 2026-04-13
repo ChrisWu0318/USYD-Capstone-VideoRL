@@ -46,6 +46,7 @@ def main():
         enforce_eager=True,
         max_model_len=4096,
         enable_prefix_caching=True,
+        seed=42,
     )
     t1 = time.time()
     if is_main:
