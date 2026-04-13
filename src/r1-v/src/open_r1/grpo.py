@@ -68,10 +68,8 @@ class GRPOScriptArguments(ScriptArguments):
         default=1,
         metadata={"help": "Tensor parallel size for vLLM in colocate mode. Should match number of training GPUs (e.g., 4 for 4x A100)."}
     )
-    vllm_gpu_memory_utilization: Optional[float] = field(
-        default=0.3,
-        metadata={"help": "Fraction of GPU memory to allocate for vLLM KV cache in colocate mode. Remaining memory is used by ZeRO-3 training."}
-    )
+    # Note: vllm_gpu_memory_utilization is already defined in GRPOConfig (trl),
+    # do NOT re-define here or argparse will conflict.
 
 
 def accuracy_reward(completions, solution, **kwargs):
