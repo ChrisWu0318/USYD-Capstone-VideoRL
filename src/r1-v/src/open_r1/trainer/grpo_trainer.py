@@ -680,8 +680,9 @@ class Qwen2VLGRPOTrainer(Trainer):
                 })
 
             # ALL ranks call generate (external_launcher requires all ranks
-            # to participate in NCCL forward pass). Only main process
-            # collects results; others pass same inputs but discard outputs.
+            # to participate in NCCL forward pass).
+            # In external_launcher TP mode, all ranks get identical results,
+            # so we don't need broadcast — each rank extracts and slices locally.
             sampling_params = copy.deepcopy(self._vllm_sampling_params)
             sampling_params.n = self.num_generations
             outputs = self._vllm_engine.generate(
@@ -689,19 +690,14 @@ class Qwen2VLGRPOTrainer(Trainer):
                 sampling_params=sampling_params,
                 use_tqdm=False,
             )
-            if self.accelerator.is_main_process:
-                completion_ids_list = [
-                    out.token_ids
-                    for completion in outputs
-                    for out in completion.outputs
-                ]
-            else:
-                # broadcast_object_list requires a list on ALL ranks, not None
-                completion_ids_list = [None]
+            # All ranks extract results (they're identical across TP ranks)
+            completion_ids_list = [
+                out.token_ids
+                for completion in outputs
+                for out in completion.outputs
+            ]
 
-            # Broadcast and slice per-process
-            from accelerate.utils import broadcast_object_list
-            completion_ids_list = broadcast_object_list(completion_ids_list, from_process=0)
+            # Slice per-process
             process_slice = slice(
                 self.accelerator.process_index * len(prompts) * self.num_generations,
                 (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
@@ -743,22 +739,17 @@ class Qwen2VLGRPOTrainer(Trainer):
                         sampling_params=shuffled_sampling_params,
                         use_tqdm=False,
                     )
-                    if self.accelerator.is_main_process:
-                        shuffled_completion_ids_list = [
-                            out.token_ids
-                            for completion in shuffled_outputs
-                            for out in completion.outputs
-                        ]
-                    else:
-                        shuffled_completion_ids_list = [None]
+                    # All ranks extract results (identical across TP ranks)
+                    shuffled_completion_ids_list = [
+                        out.token_ids
+                        for completion in shuffled_outputs
+                        for out in completion.outputs
+                    ]
                 else:
                     shuffled_completion_ids_list = []
 
                 if shuffled_all_multimodal_inputs:
-                    shuffled_completion_ids_list = broadcast_object_list(
-                        shuffled_completion_ids_list, from_process=0
-                    )
-                    # Slice by process index
+                    # Slice by process index (no broadcast needed — all ranks have same data)
                     process_id_list = []
                     for mm_item in shuffled_all_mm_data:
                         process_id_list += [mm_item[0]] * self.shuffled_num_generations
