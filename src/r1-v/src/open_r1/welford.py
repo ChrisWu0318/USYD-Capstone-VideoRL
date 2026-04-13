@@ -97,27 +97,19 @@ class BayesianWelford:
         return (base_min, dynamic_max)
 
     def state_dict(self) -> dict:
-        """导出状态, 用于 checkpoint 保存"""
+        """导出状态，用于 checkpoint 保存"""
         return {
             "count": self.count,
             "mean": self.mean,
-            "_m2": self._m2,
+            "M2": self._m2,
             "sigma_prior_sq": self.sigma_prior_sq,
             "k_prior": self.k_prior,
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """从 checkpoint 恢复状态"""
+        """从 checkpoint 恢复状态，兼容旧版 'M2' / '_m2' key 名"""
         self.count = state["count"]
         self.mean = state["mean"]
-        self._m2 = state["_m2"]
-        self.sigma_prior_sq = state["sigma_prior_sq"]
-        self.k_prior = state["k_prior"]
-
-    def state_dict(self):
-        return {"count": self.count, "mean": self.mean, "M2": self._m2}
-
-    def load_state_dict(self, state):
-        self.count = state["count"]
-        self.mean = state["mean"]
-        self._m2 = state["M2"]
+        self._m2 = state.get("M2") if state.get("M2") is not None else state.get("_m2", 0.0)
+        self.sigma_prior_sq = state.get("sigma_prior_sq", self.sigma_prior_sq)
+        self.k_prior = state.get("k_prior", self.k_prior)
