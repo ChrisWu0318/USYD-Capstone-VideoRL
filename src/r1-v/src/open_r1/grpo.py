@@ -21,7 +21,7 @@ from typing import Optional
 from datasets import load_dataset, load_from_disk
 from transformers import Qwen2VLForConditionalGeneration
 
-from trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
+from trainer import Qwen2VLGRPOTrainer
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from datasets import Dataset, DatasetDict
@@ -63,6 +63,18 @@ class GRPOScriptArguments(ScriptArguments):
     experiment_config: Optional[str] = field(
         default = None,
         metadata = {"help": "Path to experiment YAML config (e.g. configs/ablation_d2_kl.yaml)"}  # [FIX-1] metadate → metadata
+    )
+    use_vllm: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Use vLLM colocate mode for generation (requires vllm >= 0.8.0). Shares all training GPUs for vLLM TP generation."},
+    )
+    vllm_tensor_parallel_size: Optional[int] = field(
+        default=4,
+        metadata={"help": "Tensor parallel size for vLLM colocate generation. Should match number of training GPUs."},
+    )
+    vllm_gpu_memory_utilization: Optional[float] = field(
+        default=0.3,
+        metadata={"help": "Fraction of GPU memory to allocate for vLLM KV cache (0.0-1.0). Lower values leave more room for training."},
     )
 
 
@@ -289,8 +301,10 @@ def main(script_args, training_args, model_args):
     dataset = dataset.map(make_conversation_image_and_video)
 
     
-    trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
-    print("using: ", trainer_cls)
+    trainer_cls = Qwen2VLGRPOTrainer
+    # vLLM colocate mode is now built into Qwen2VLGRPOTrainer via use_vllm flag.
+    # No separate trainer class needed.
+    print("using: ", trainer_cls, " | use_vllm:", script_args.use_vllm)
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
@@ -304,6 +318,9 @@ def main(script_args, training_args, model_args):
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
+        use_vllm=script_args.use_vllm,
+        vllm_tensor_parallel_size=script_args.vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=script_args.vllm_gpu_memory_utilization,
     )
     
     if training_args.resume_from_checkpoint is not None:

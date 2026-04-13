@@ -14,8 +14,11 @@
 
 import os
 import textwrap
+import warnings
+import gc
 from collections import defaultdict
 from typing import Any, Callable, Optional, Union
+from unittest.mock import patch
 import random
 
 import torch
@@ -41,6 +44,8 @@ from transformers import (
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
+from accelerate.utils import broadcast_object_list, gather_object
+from accelerate.utils.other import is_compiled_module
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
@@ -53,6 +58,13 @@ from welford import BayesianWelford
 from temporal_mask import build_temporal_frame_mask  # [FIX-3] 帧级部分 mask
 
 import copy
+
+# vLLM colocate support (optional, requires vllm >= 0.8.0)
+try:
+    from vllm import LLM, SamplingParams
+    IS_VLLM_AVAILABLE = True
+except ImportError:
+    IS_VLLM_AVAILABLE = False
 
 
 if is_peft_available():
@@ -167,6 +179,9 @@ class Qwen2VLGRPOTrainer(Trainer):
         max_pixels: Optional[int] = 12845056,
         min_pixels: Optional[int] = 3136,
         attn_implementation: str = "flash_attention_2",
+        use_vllm: bool = False,
+        vllm_tensor_parallel_size: int = 4,
+        vllm_gpu_memory_utilization: float = 0.3,
     ):
         # Args
         if args is None:
@@ -378,6 +393,101 @@ class Qwen2VLGRPOTrainer(Trainer):
         if self.accelerator.is_main_process:
             print(self.exp_config.summary())
 
+        # ---- vLLM Colocate Initialization ----
+        self.use_vllm = use_vllm
+        self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
+        self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        if self.use_vllm:
+            self._init_vllm(model_id, max_pixels, min_pixels)
+
+    # ------------------------------------------------------------------ #
+    # vLLM Colocate: Initialization, Weight Sync, Sleep/Wake              #
+    # ------------------------------------------------------------------ #
+    def _init_vllm(self, model_id, max_pixels, min_pixels):
+        """Initialize vLLM in colocate mode using external_launcher.
+        
+        All training processes participate as a TP group for vLLM generation.
+        After init, vLLM is immediately put to sleep to free GPU memory for training.
+        """
+        if not IS_VLLM_AVAILABLE:
+            raise ImportError(
+                "vLLM colocate mode requires vllm >= 0.8.0. "
+                "Install with: pip install vllm>=0.8.0"
+            )
+        tp_size = self.vllm_tensor_parallel_size
+        if self.accelerator.is_main_process:
+            print(f"[vLLM Colocate] Initializing with TP={tp_size}, "
+                  f"gpu_mem_util={self.vllm_gpu_memory_utilization}")
+
+        # Patch torch.distributed.get_world_size so vLLM's TP setup
+        # matches our tensor_parallel_size, not the training world size.
+        world_size_patch = patch(
+            "torch.distributed.get_world_size", return_value=tp_size
+        )
+        profiling_patch = patch(
+            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+            return_value=None,
+        )
+        with world_size_patch, profiling_patch:
+            self.llm = LLM(
+                model=model_id,
+                tensor_parallel_size=tp_size,
+                gpu_memory_utilization=self.vllm_gpu_memory_utilization,
+                distributed_executor_backend="external_launcher",
+                dtype=torch.bfloat16,
+                enable_prefix_caching=True,
+                enforce_eager=True,
+                max_model_len=self.max_prompt_length + self.max_completion_length,
+                seed=self.accelerator.process_index,
+                mm_processor_kwargs={
+                    "max_pixels": max_pixels,
+                    "min_pixels": min_pixels,
+                },
+            )
+        self.sampling_params = SamplingParams(
+            temperature=1.0,
+            top_p=0.95,
+            max_tokens=self.max_completion_length,
+        )
+        self._last_loaded_step = -1  # force sync on first generation
+        # Immediately sleep vLLM to free GPU memory for training
+        self._vllm_sleep()
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            print("[vLLM Colocate] Initialized and sleeping. Training will use GPU memory.")
+
+    def _sync_vllm_weights(self):
+        """Gather training model weights and load them into the vLLM model.
+        
+        Only the main process actually loads weights; other TP ranks get them
+        via vLLM's internal broadcast.
+        """
+        with unwrap_model_for_generation(
+            self.model, self.accelerator, gather_deepspeed3_params=True
+        ) as unwrapped_model:
+            if is_compiled_module(unwrapped_model):
+                state_dict = unwrapped_model._orig_mod.state_dict()
+            else:
+                state_dict = unwrapped_model.state_dict()
+        if self.accelerator.is_main_process:
+            llm_model = (
+                self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            )
+            llm_model.load_weights(state_dict.items())
+        self._last_loaded_step = self.state.global_step
+
+    def _vllm_sleep(self):
+        """Free vLLM GPU memory (Level 2: unload weights + KV cache).
+        Called before training steps to give GPU memory back to DeepSpeed.
+        """
+        if hasattr(self, 'llm') and hasattr(self.llm, 'sleep'):
+            self.llm.sleep(level=2)
+
+    def _vllm_wake_up(self):
+        """Restore vLLM GPU memory. Called before generation steps."""
+        if hasattr(self, 'llm') and hasattr(self.llm, 'wake_up'):
+            self.llm.wake_up()
+
     # ------------------------------------------------------------------ #
     # [FIX-5] Welford checkpoint save / restore                          #
     # ------------------------------------------------------------------ #
@@ -509,32 +619,157 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         
         # Generate completions
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)
+        if self.use_vllm:
+            # ---- vLLM Colocate Generation ----
             prompt_length = prompt_ids.size(1)
-            prompt_ids = prompt_completion_ids[:, :prompt_length]
-            completion_ids = prompt_completion_ids[:, prompt_length:]
-            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
-            
-            if self.temporal:
-                
-                if video_inputs:
-            
-                    shuffled_prompt_completion_ids = unwrapped_model.generate(**shuffled_prompt_inputs, generation_config=self.shuffled_generation_config)
-                    shuffled_prompt_length = shuffled_prompt_ids.size(1)
-                    shuffled_prompt_ids = shuffled_prompt_completion_ids[:, :shuffled_prompt_length]
-                    shuffled_completion_ids = shuffled_prompt_completion_ids[:, shuffled_prompt_length:]
-                    shuffled_prompt_mask = prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
-                    
-                else:
-                    
-                    shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
+            device = self.accelerator.device
+            data_type = inputs[0]['data_type']
 
-        # [FIX-7] Debug prints gated behind DEBUG_MODE
-        if os.getenv("DEBUG_MODE") == "true":
-            print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
-            print('problem_id:', inputs[0]['problem_id'])       
-            print('prompt_length:', prompt_length)
+            # 1. Wake vLLM and sync weights if model has been updated
+            if self.state.global_step != self._last_loaded_step:
+                self._vllm_wake_up()
+                self._sync_vllm_weights()
+            else:
+                self._vllm_wake_up()
+
+            # 2. Gather prompts + multimodal data from all DP ranks
+            all_prompts_text = gather_object(prompts_text)
+            mm_data = [[data_type, image_inputs if image_inputs else video_inputs]]
+            all_mm_data = gather_object(mm_data)
+
+            # Build vLLM multimodal inputs
+            all_multimodal_inputs = []
+            for prompt, mm_item in zip(all_prompts_text, all_mm_data):
+                all_multimodal_inputs.append({
+                    "prompt": prompt,
+                    "multi_modal_data": {mm_item[0]: mm_item[1]}
+                })
+
+            # 3. Generate on ALL ranks (vLLM handles TP internally)
+            sampling_params = copy.deepcopy(self.sampling_params)
+            sampling_params.n = self.num_generations
+            outputs = self.llm.generate(
+                all_multimodal_inputs,
+                sampling_params=sampling_params,
+                use_tqdm=False,
+            )
+
+            # Flatten: [prompt1_gen1, prompt1_gen2, ..., prompt2_gen1, ...]
+            completion_ids_list = [
+                out.token_ids for completion in outputs for out in completion.outputs
+            ]
+
+            # 4. Handle temporal (shuffled) generation
+            shuffled_completion_ids_list = None
+            shuffled_all_mm_data = None
+            if self.temporal and video_inputs:
+                shuffled_mm_data = [
+                    [self.accelerator.process_index, data_type,
+                     image_inputs if image_inputs else shuffled_video_inputs]
+                ]
+                shuffled_all_mm_data_none = gather_object(shuffled_mm_data)
+                shuffled_all_mm_data = [x for x in shuffled_all_mm_data_none if x]
+
+                if shuffled_all_mm_data:
+                    shuffled_all_multimodal_inputs = []
+                    for mm_item in shuffled_all_mm_data:
+                        shuffled_all_multimodal_inputs.append({
+                            "prompt": all_prompts_text[mm_item[0]],
+                            "multi_modal_data": {mm_item[1]: mm_item[2]}
+                        })
+                    shuffled_sampling_params = copy.deepcopy(self.sampling_params)
+                    shuffled_sampling_params.n = self.shuffled_num_generations
+                    shuffled_outputs = self.llm.generate(
+                        shuffled_all_multimodal_inputs,
+                        sampling_params=shuffled_sampling_params,
+                        use_tqdm=False,
+                    )
+                    shuffled_completion_ids_list = [
+                        out.token_ids for completion in shuffled_outputs
+                        for out in completion.outputs
+                    ]
+
+            # 5. Broadcast and slice results to each DP rank
+            completion_ids_list = broadcast_object_list(completion_ids_list, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts) * self.num_generations,
+                (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
+            )
+            completion_ids_list = completion_ids_list[process_slice]
+
+            # Pad completions and concatenate with prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids_list]
+            from trl.trainer.utils import pad
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            prompt_ids = prompt_ids.repeat_interleave(self.num_generations, dim=0)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+
+            # Handle shuffled results
+            if self.temporal and video_inputs and shuffled_completion_ids_list is not None:
+                shuffled_completion_ids_list = broadcast_object_list(
+                    shuffled_completion_ids_list, from_process=0
+                )
+                # Build process_id_list for correct slicing
+                process_id_list = []
+                for mm_item in shuffled_all_mm_data:
+                    process_id_list += [mm_item[0]] * len(prompts) * self.shuffled_num_generations
+
+                cur_shuffled_ids = []
+                for i in range(len(process_id_list)):
+                    if self.accelerator.process_index == process_id_list[i]:
+                        cur_shuffled_ids.append(shuffled_completion_ids_list[i])
+                cur_shuffled_ids = [torch.tensor(ids, device=device) for ids in cur_shuffled_ids]
+                shuffled_completion_ids = pad(
+                    cur_shuffled_ids, padding_value=self.processing_class.pad_token_id
+                )
+                shuffled_prompt_mask = prompt_mask.repeat_interleave(
+                    self.shuffled_num_generations, dim=0
+                )
+            elif self.temporal and not video_inputs:
+                # Dummy generation for image-only temporal
+                dummy_ids = torch.ones(
+                    (len(prompts) * self.shuffled_num_generations, 1),
+                    dtype=torch.long, device=device
+                ) * self.processing_class.pad_token_id
+                shuffled_completion_ids = dummy_ids
+
+            # 6. Sleep vLLM to free GPU memory for training
+            self._vllm_sleep()
+
+            if os.getenv("DEBUG_MODE") == "true":
+                print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])
+                print('problem_id:', inputs[0]['problem_id'])
+                print('prompt_length:', prompt_length)
+
+        else:
+            # ---- Original HF generate path ----
+            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+                prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)
+                prompt_length = prompt_ids.size(1)
+                prompt_ids = prompt_completion_ids[:, :prompt_length]
+                completion_ids = prompt_completion_ids[:, prompt_length:]
+                prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+                
+                if self.temporal:
+                    
+                    if video_inputs:
+            
+                        shuffled_prompt_completion_ids = unwrapped_model.generate(**shuffled_prompt_inputs, generation_config=self.shuffled_generation_config)
+                        shuffled_prompt_length = shuffled_prompt_ids.size(1)
+                        shuffled_prompt_ids = shuffled_prompt_completion_ids[:, :shuffled_prompt_length]
+                        shuffled_completion_ids = shuffled_prompt_completion_ids[:, shuffled_prompt_length:]
+                        shuffled_prompt_mask = prompt_mask.repeat_interleave(self.shuffled_num_generations, dim=0)
+                        
+                    else:
+                        
+                        shuffled_prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.dummy_generation_config)
+
+            # [FIX-7] Debug prints gated behind DEBUG_MODE
+            if os.getenv("DEBUG_MODE") == "true":
+                print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
+                print('problem_id:', inputs[0]['problem_id'])       
+                print('prompt_length:', prompt_length)
                 
         
         
