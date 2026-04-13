@@ -14,8 +14,8 @@ cd src/r1-v
 export DEBUG_MODE="true"
 export LOG_PATH="./vllm_colocate_run.txt"
 
-QWEN_PATH='SFT Model Path'
-HF_DATASET="./Video-R1-data/Video-R1-260k.json"
+QWEN_PATH='/workspace/Video-R1/Qwen2.5-VL-7B-COT-SFT'
+HF_DATASET="./Video-R1-data/Video-R1-500-subset.json"
 OUTPUT_DIR="./log/Qwen2.5-VL-7B-Video-GRPO-Colocate"
 if [ ! -d "$OUTPUT_DIR" ]; then
   mkdir -p "$OUTPUT_DIR"
