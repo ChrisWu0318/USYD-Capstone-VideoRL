@@ -553,13 +553,15 @@ class Qwen2VLGRPOTrainer(Trainer):
 
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    # [OOM-FIX] Micro-batched forward: process micro_batch_size samples at a time
-    # to avoid the 17GB logits tensor from lm_head (B=4, L=14700, V=151936 in bf16).
-    # After vLLM sleep, each GPU has ~49GB free. B=2 logits = ~8GB, fits comfortably.
+    # [OOM-FIX] Micro-batched forward to cap peak memory from lm_head logits.
+    # After vLLM sleep, each GPU has ~49GB free, so B=4 (17GB logits) usually fits.
+    # For very long videos that still OOM, we fall back to micro_batch=2.
     # Math is identical — logps are per-token, no cross-sample dependency.
     def _get_per_token_logps(self, model, input_ids, **kwargs):
         batch_size = input_ids.size(0)
-        micro_batch_size = getattr(self, '_micro_batch_size', 2)
+        # Default: no micro-batching (full batch). Override via self._micro_batch_size
+        # if OOM fallback sets it to 2.
+        micro_batch_size = getattr(self, '_micro_batch_size', batch_size)
         per_token_logps = []
         for start in range(0, batch_size, micro_batch_size):
             end = min(start + micro_batch_size, batch_size)
@@ -861,12 +863,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         
         
-        # [OOM-FIX] With vLLM colocate, GPU memory is tight. If the forward
-        # pass with visual inputs OOMs, we retry WITHOUT visual inputs (pure text).
-        # This is a safe fallback: the model still gets gradient signal from the
-        # text tokens, just without the vision encoder activation.
-        # IMPORTANT: All ranks must follow the SAME code path to keep ZeRO-3
-        # parameter coordinator in sync. We use a collective flag to ensure this.
+        # [OOM-FIX] If B=4 forward OOMs (rare, only for very long videos),
+        # fall back to micro_batch=2 to halve peak memory. This preserves
+        # visual inputs and gradient quality — just costs extra all-gather.
+        # All ranks must follow the SAME path for ZeRO-3 consistency.
+        self._micro_batch_size = len(prompt_completion_ids)  # default: full batch
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
@@ -876,13 +877,13 @@ class Qwen2VLGRPOTrainer(Trainer):
                 _logps_oom_flag = torch.tensor([1], device=self.accelerator.device)
             else:
                 raise
-        # Collective: if ANY rank OOMed, ALL ranks retry without visual inputs
         torch.distributed.all_reduce(_logps_oom_flag, op=torch.distributed.ReduceOp.MAX)
         if _logps_oom_flag.item() == 1:
             if self.accelerator.is_main_process:
-                print(f"[OOM-FIX] per_token_logps OOM, retrying without visual inputs")
+                print(f"[OOM-FIX] per_token_logps OOM with B={len(prompt_completion_ids)}, retrying with micro_batch=2")
             torch.cuda.empty_cache()
-            per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
+            self._micro_batch_size = 2
+            per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         
         # ============================================================== #
@@ -930,12 +931,11 @@ class Qwen2VLGRPOTrainer(Trainer):
                     model.train()
 
         with torch.inference_mode():
-            # [OOM-FIX] Same collective OOM strategy for ref_model forward pass
+            # [OOM-FIX] Same micro_batch fallback for ref_model forward
             try:
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs)
                 else:
-                    # No PEFT adapter in our setup; use model directly for ref logps
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
                 _ref_oom_flag = torch.tensor([0], device=self.accelerator.device)
@@ -947,12 +947,13 @@ class Qwen2VLGRPOTrainer(Trainer):
             torch.distributed.all_reduce(_ref_oom_flag, op=torch.distributed.ReduceOp.MAX)
             if _ref_oom_flag.item() == 1:
                 if self.accelerator.is_main_process:
-                    print(f"[OOM-FIX] ref_per_token_logps OOM or device mismatch, retrying without visual inputs")
+                    print(f"[OOM-FIX] ref_per_token_logps OOM, retrying with micro_batch=2")
                 torch.cuda.empty_cache()
+                self._micro_batch_size = 2
                 if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids)
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs)
                 else:
-                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
+                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
 
         # Compute the KL divergence between the model and the reference model
