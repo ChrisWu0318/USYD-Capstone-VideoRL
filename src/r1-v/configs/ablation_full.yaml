@@ -22,6 +22,9 @@ welford_sigma_prior: 100.0
 welford_k_prior: 50
 welford_warmup_steps: 50
 
+# D3 开启时必须关闭原始 len_control, 避免 double-penalty
+override_len_control: false
+
 # 维度一: ON
 enable_causal_reward: true
 softplus_beta: 2.0

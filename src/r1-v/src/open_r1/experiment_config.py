@@ -70,6 +70,16 @@ class ExperimentConfig:
     causal_reward_scale: float = 0.5        # 叠加到 reward 时的缩放因子
 
     # ================================================================
+    # 训练参数覆盖 (与原始 T-GRPO 默认行为的交互控制)
+    # ================================================================
+
+    # D3 开启时, 必须关闭原始的 len_control (硬编码 320-512 / +0.2),
+    # 否则会和 D3 的动态长度惩罚 double-penalty.
+    # None = 不覆盖, 遵从命令行 --len_control 的值
+    # True/False = 强制覆盖
+    override_len_control: Optional[bool] = None
+
+    # ================================================================
     # 方法
     # ================================================================
 
@@ -121,6 +131,7 @@ class ExperimentConfig:
             + (f" (α={self.length_penalty_alpha}, β={self.length_penalty_beta})" if self.enable_length_penalty else ""),
             f"  [D1] Causal Reward:     {'ON' if self.enable_causal_reward else 'OFF'}"
             + (f" (β_s={self.softplus_beta}, clip={self.causal_reward_clip})" if self.enable_causal_reward else ""),
+            f"  [Override] len_control: {self.override_len_control if self.override_len_control is not None else 'unchanged (CLI)'}",
         ]
         return "\n".join(lines)
 
