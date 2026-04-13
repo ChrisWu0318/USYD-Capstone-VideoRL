@@ -25,6 +25,8 @@ def main():
             f"vLLM {vllm.__version__} < 0.8.0, sleep/wake not available!"
 
     # Step 2: 初始化 vLLM LLM 引擎
+    # external_launcher 模式下，ALL ranks 必须都创建 LLM 对象
+    # rank 0 是 driver，其余 rank 是 worker
     from vllm import LLM, SamplingParams
 
     model_path = os.environ.get("MODEL_PATH", "./Qwen2.5-VL-7B-COT-SFT")
@@ -37,6 +39,7 @@ def main():
         print(f"[Rank {rank}]   TP: {tp}, gpu_mem_util: {gpu_mem_util}")
 
     t0 = time.time()
+    # ALL ranks create LLM - external_launcher uses torchrun's distributed env
     llm = LLM(
         model=model_path,
         tensor_parallel_size=tp,
@@ -52,14 +55,14 @@ def main():
     if is_main:
         print(f"[Rank {rank}] LLM engine initialized in {t1-t0:.1f}s")
 
-    # Step 3: 测试 wake_up
+    # Step 3: 测试 wake_up（all ranks）
     if is_main:
         print(f"[Rank {rank}] Testing wake_up()...")
     llm.wake_up()
     if is_main:
         print(f"[Rank {rank}] wake_up() OK")
 
-    # Step 4: 简单文本生成
+    # Step 4: 简单文本生成（只有 driver/rank0 调用 generate）
     sampling_params = SamplingParams(temperature=0.0, max_tokens=32)
     if is_main:
         print(f"[Rank {rank}] Testing text generation...")
@@ -68,7 +71,7 @@ def main():
             print(f"[Rank {rank}] Generated: {output.outputs[0].text[:80]}")
         print(f"[Rank {rank}] Text generation OK")
 
-    # Step 5: 测试 sleep
+    # Step 5: 测试 sleep（all ranks）
     if is_main:
         print(f"[Rank {rank}] Testing sleep()...")
     llm.sleep(level=1)
@@ -85,7 +88,7 @@ def main():
         for output in outputs:
             print(f"[Rank {rank}] Generated: {output.outputs[0].text[:80]}")
 
-    # Step 7: 最终 sleep
+    # Step 7: 最终 sleep（all ranks）
     llm.sleep(level=1)
     if is_main:
         print(f"[Rank {rank}] Final sleep() OK")

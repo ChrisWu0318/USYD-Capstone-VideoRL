@@ -445,16 +445,15 @@ class Qwen2VLGRPOTrainer(Trainer):
         DeepSpeed ZeRO-3 controls the distributed environment, so vLLM uses
         'external_launcher' to avoid re-initializing NCCL/torch.distributed.
 
+        IMPORTANT: With external_launcher, ALL ranks must create their own LLM
+        instance. Rank 0 becomes the driver, other ranks become TP workers.
+        Only rank 0 calls generate(); the others participate via torch.distributed.
+
         Memory budget:
           - vllm_gpu_memory_utilization=0.3 -> 30% of VRAM for KV cache
           - Remaining 70% for ZeRO-3 model states, optimizer, gradients
         """
-        if not self.accelerator.is_main_process:
-            # Non-main processes just participate in TP via torchrun
-            # They don't create their own LLM instance; external_launcher handles it
-            self.accelerator.wait_for_everyone()
-            return
-
+        # ALL ranks create LLM - external_launcher uses the torchrun distributed env
         self._vllm_engine = LLM(
             model=model_id,
             tensor_parallel_size=self.vllm_tp,
