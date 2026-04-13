@@ -863,11 +863,26 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         
         
-        # [OOM-FIX] If B=4 forward OOMs (rare, only for very long videos),
-        # fall back to micro_batch=2 to halve peak memory. This preserves
-        # visual inputs and gradient quality — just costs extra all-gather.
-        # All ranks must follow the SAME path for ZeRO-3 consistency.
-        self._micro_batch_size = len(prompt_completion_ids)  # default: full batch
+        # [OOM-FIX] Pre-emptive micro-batch sizing based on estimated memory.
+        # After vLLM sleep, ~49GB free. lm_head logits = B * L * V * 2 bytes.
+        # Long videos (>8000 tokens) with B=4 produce ~18GB logits + ~8GB ViT
+        # activations = 57GB peak > 80GB -> OOM. Pre-split to avoid wasted retry.
+        batch_size = len(prompt_completion_ids)
+        seq_len = prompt_completion_ids.size(1)
+        # logits size in GB (bf16)
+        logits_gb_full = batch_size * seq_len * 151936 * 2 / 1e9
+        # Available GPU memory after vLLM sleep (~49GB, minus ViT activations ~5-8GB)
+        available_gb = torch.cuda.get_device_properties(self.accelerator.device).total_memory / 1e9
+        used_gb = torch.cuda.memory_allocated(self.accelerator.device) / 1e9
+        free_gb = available_gb - used_gb
+        # Rule: if full-batch logits > 40% of free memory, use micro_batch=2
+        if logits_gb_full > free_gb * 0.4:
+            self._micro_batch_size = max(1, batch_size // 2)
+            if self.accelerator.is_main_process:
+                print(f"[MEM] prompt_length={prompt_length}, logits(B={batch_size})={logits_gb_full:.1f}GB > {free_gb*0.4:.1f}GB limit, using micro_batch={self._micro_batch_size}")
+        else:
+            self._micro_batch_size = batch_size
+
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
@@ -880,9 +895,9 @@ class Qwen2VLGRPOTrainer(Trainer):
         torch.distributed.all_reduce(_logps_oom_flag, op=torch.distributed.ReduceOp.MAX)
         if _logps_oom_flag.item() == 1:
             if self.accelerator.is_main_process:
-                print(f"[OOM-FIX] per_token_logps OOM with B={len(prompt_completion_ids)}, retrying with micro_batch=2")
+                print(f"[OOM-FIX] per_token_logps OOM, reducing micro_batch to {max(1, self._micro_batch_size // 2)}")
             torch.cuda.empty_cache()
-            self._micro_batch_size = 2
+            self._micro_batch_size = max(1, self._micro_batch_size // 2)
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         
@@ -947,9 +962,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             torch.distributed.all_reduce(_ref_oom_flag, op=torch.distributed.ReduceOp.MAX)
             if _ref_oom_flag.item() == 1:
                 if self.accelerator.is_main_process:
-                    print(f"[OOM-FIX] ref_per_token_logps OOM, retrying with micro_batch=2")
+                    print(f"[OOM-FIX] ref_per_token_logps OOM, reducing micro_batch to {max(1, self._micro_batch_size // 2)}")
                 torch.cuda.empty_cache()
-                self._micro_batch_size = 2
+                self._micro_batch_size = max(1, self._micro_batch_size // 2)
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs)
                 else:
