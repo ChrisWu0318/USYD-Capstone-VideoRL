@@ -696,7 +696,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                     for out in completion.outputs
                 ]
             else:
-                completion_ids_list = None
+                # broadcast_object_list requires a list on ALL ranks, not None
+                completion_ids_list = [None]
 
             # Broadcast and slice per-process
             from accelerate.utils import broadcast_object_list
@@ -749,7 +750,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                             for out in completion.outputs
                         ]
                     else:
-                        shuffled_completion_ids_list = None
+                        shuffled_completion_ids_list = [None]
                 else:
                     shuffled_completion_ids_list = []
 
