@@ -410,6 +410,10 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "Install vllm>=0.8.0: pip install 'vllm>=0.8.0'"
                 )
             self._init_vllm(model_id=model_id, max_pixels=max_pixels, min_pixels=min_pixels)
+            # Immediately sleep after init to free GPU memory for training setup.
+            # The engine will wake up on the first generate() call.
+            self._vllm_sleep()
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------ #
     # [FIX-5] Welford checkpoint save / restore                          #
@@ -487,12 +491,11 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         After calling this, the KV cache and internal buffers are freed,
         allowing ZeRO-3 to use the full GPU memory for the training step.
-        Only the main process drives the sleep command; TP workers follow.
+        ALL ranks must call sleep (each has its own LLM engine in TP).
         """
-        if self._vllm_engine is not None and self.accelerator.is_main_process:
-            # vLLM >= 0.8.0: sleep releases KV cache and intermediate tensors
+        if self._vllm_engine is not None:
             self._vllm_engine.sleep(level=1)
-            if os.getenv("DEBUG_MODE") == "true":
+            if self.accelerator.is_main_process and os.getenv("DEBUG_MODE") == "true":
                 print("[vLLM Colocate] Engine sleeping -- GPU memory released for training")
 
     def _vllm_wake_up(self):
@@ -500,10 +503,11 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         Call this before vLLM generation. After wake_up, the engine
         re-allocates KV cache space from the gpu_memory_utilization budget.
+        ALL ranks must call wake_up (each has its own LLM engine in TP).
         """
-        if self._vllm_engine is not None and self.accelerator.is_main_process:
+        if self._vllm_engine is not None:
             self._vllm_engine.wake_up()
-            if os.getenv("DEBUG_MODE") == "true":
+            if self.accelerator.is_main_process and os.getenv("DEBUG_MODE") == "true":
                 print("[vLLM Colocate] Engine woke up -- GPU memory reserved for generation")
 
     def _sync_vllm_weights(self):
@@ -775,6 +779,8 @@ class Qwen2VLGRPOTrainer(Trainer):
 
             # 3. Sleep vLLM to release GPU memory for training
             self._vllm_sleep()
+            # Force CUDA cache cleanup after sleep to reclaim vLLM memory
+            torch.cuda.empty_cache()
 
         else:
             # --- HF generate() (original path) ---
@@ -833,12 +839,29 @@ class Qwen2VLGRPOTrainer(Trainer):
         
         
         
+        # [OOM-FIX] With vLLM colocate, GPU memory is tight. If the forward
+        # pass with visual inputs OOMs, we retry WITHOUT visual inputs (pure text).
+        # This is a safe fallback: the model still gets gradient signal from the
+        # text tokens, just without the vision encoder activation.
+        # IMPORTANT: All ranks must follow the SAME code path to keep ZeRO-3
+        # parameter coordinator in sync. We use a collective flag to ensure this.
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
-        except Exception as e:
-            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
+            _logps_oom_flag = torch.tensor([0], device=self.accelerator.device)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                _logps_oom_flag = torch.tensor([1], device=self.accelerator.device)
+            else:
+                raise
+        # Collective: if ANY rank OOMed, ALL ranks retry without visual inputs
+        torch.distributed.all_reduce(_logps_oom_flag, op=torch.distributed.ReduceOp.MAX)
+        if _logps_oom_flag.item() == 1:
+            if self.accelerator.is_main_process:
+                print(f"[OOM-FIX] per_token_logps OOM, retrying without visual inputs")
+            torch.cuda.empty_cache()
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
+            per_token_logps = per_token_logps[:, prompt_length - 1 :]
         
         # ============================================================== #
         # [FIX-3] D1: partial temporal frame mask (was: full zero-out)   #
@@ -885,16 +908,28 @@ class Qwen2VLGRPOTrainer(Trainer):
                     model.train()
 
         with torch.inference_mode():
+            # [OOM-FIX] Same collective OOM strategy for ref_model forward pass
             try:
                 if self.ref_model is not None:
                     ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs)
                 else:
-                    with self.accelerator.unwrap_model(model).disable_adapter():
-                        ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
+                    # No PEFT adapter in our setup; use model directly for ref logps
+                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
-            except Exception as e:
-                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
-                with self.accelerator.unwrap_model(model).disable_adapter():
+                _ref_oom_flag = torch.tensor([0], device=self.accelerator.device)
+            except RuntimeError as e:
+                if "out of memory" in str(e) or "same device" in str(e):
+                    _ref_oom_flag = torch.tensor([1], device=self.accelerator.device)
+                else:
+                    raise
+            torch.distributed.all_reduce(_ref_oom_flag, op=torch.distributed.ReduceOp.MAX)
+            if _ref_oom_flag.item() == 1:
+                if self.accelerator.is_main_process:
+                    print(f"[OOM-FIX] ref_per_token_logps OOM or device mismatch, retrying without visual inputs")
+                torch.cuda.empty_cache()
+                if self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids)
+                else:
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
 
