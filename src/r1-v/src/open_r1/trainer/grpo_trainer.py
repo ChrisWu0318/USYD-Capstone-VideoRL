@@ -553,33 +553,38 @@ class Qwen2VLGRPOTrainer(Trainer):
 
 
     # Get the per-token log probabilities for the completions for the model and the reference model
-    # [OOM-FIX] Micro-batched forward: process 1 sample at a time to avoid
-    # the 17GB logits tensor from lm_head (B=4, L=14700, V=151936 in bf16).
+    # [OOM-FIX] Micro-batched forward: process micro_batch_size samples at a time
+    # to avoid the 17GB logits tensor from lm_head (B=4, L=14700, V=151936 in bf16).
+    # After vLLM sleep, each GPU has ~49GB free. B=2 logits = ~8GB, fits comfortably.
     # Math is identical — logps are per-token, no cross-sample dependency.
     def _get_per_token_logps(self, model, input_ids, **kwargs):
         batch_size = input_ids.size(0)
+        micro_batch_size = getattr(self, '_micro_batch_size', 2)
         per_token_logps = []
-        for i in range(batch_size):
-            # Slice batch dimension for this micro-sample
-            micro_input_ids = input_ids[i:i+1]
+        for start in range(0, batch_size, micro_batch_size):
+            end = min(start + micro_batch_size, batch_size)
+            micro_input_ids = input_ids[start:end]
             micro_kwargs = {}
             for k, v in kwargs.items():
                 if isinstance(v, torch.Tensor) and v.shape[0] == batch_size:
-                    micro_kwargs[k] = v[i:i+1]
+                    micro_kwargs[k] = v[start:end]
                 elif isinstance(v, torch.Tensor) and v.shape[0] % batch_size == 0:
-                    # For pixel_values repeated across generations: each gen gets 1 share
+                    # For pixel_values repeated across generations: each gen gets its share
                     chunk = v.shape[0] // batch_size
-                    micro_kwargs[k] = v[i*chunk:(i+1)*chunk]
+                    micro_kwargs[k] = v[start*chunk:end*chunk]
                 else:
                     micro_kwargs[k] = v
             logits = model(micro_input_ids, **micro_kwargs).logits
-            logits = logits[:, :-1, :]  # (1, L-1, V)
-            ids = micro_input_ids[:, 1:]  # (1, L-1)
-            log_probs = logits.log_softmax(dim=-1)
-            token_log_prob = torch.gather(log_probs, dim=-1, index=ids.unsqueeze(-1)).squeeze(-1)  # (1, L-1)
-            per_token_logps.append(token_log_prob.squeeze(0))
-            # Free logits immediately to keep peak memory low
-            del logits, log_probs
+            logits = logits[:, :-1, :]  # (mbs, L-1, V)
+            ids = micro_input_ids[:, 1:]  # (mbs, L-1)
+            # Per-row log_softmax + gather to compute log p(x_t | x_<t)
+            for row_logits, row_ids in zip(logits, ids):
+                log_probs = row_logits.log_softmax(dim=-1)
+                token_log_prob = torch.gather(log_probs, dim=-1, index=row_ids.unsqueeze(-1)).squeeze(-1)
+                per_token_logps.append(token_log_prob)
+            del logits
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return torch.stack(per_token_logps)
     
     def remove_none_from_data(self, data):
