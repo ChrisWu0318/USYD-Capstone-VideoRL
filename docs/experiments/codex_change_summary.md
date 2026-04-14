@@ -73,3 +73,27 @@
 
 ## Notes
 - `pytest` is not installed in this local environment, so the new test files were executed directly with Python instead of `python -m pytest`.
+
+## Follow-up Patch: Smoke-Launch Practicality
+- `src/scripts/research_branch/_common.sh`
+  - `nproc_per_node` no longer defaults blindly to `4`.
+  - Resolution order is now:
+    1. `RESEARCH_NPROC_PER_NODE`
+    2. inferred GPU count from `RESEARCH_CUDA_VISIBLE_DEVICES`
+    3. fallback to `1`
+  - Launcher logs now print `resolved_nproc_per_node`.
+  - Added `RESEARCH_DRY_RUN=true` support so launch command assembly can be checked without starting training.
+- `src/r1-v/src/open_r1/grpo.py`
+  - Removed the duplicate local `use_vllm` / vLLM sizing field declarations from `GRPOScriptArguments`.
+  - The parser now relies on the inherited TRL `ScriptArguments` definitions so the CLI only exposes one effective `use_vllm` option.
+- `src/scripts/research_branch/smoke_test_single_gpu.sh`
+  - Added a direct single-GPU smoke launcher using `deepspeed --num_gpus=1 src/open_r1/grpo.py ...`.
+  - It keeps the same output naming and research logging style as the existing wrappers.
+
+## Follow-up Validation
+- `bash -n` on the modified research scripts
+- `python -m py_compile` on `src/r1-v/src/open_r1/grpo.py`
+- Dry-run command assembly checks:
+  - `smoke_test_single_gpu.sh` with `RESEARCH_DRY_RUN=true` resolved `nproc_per_node=1`
+  - `smoke_test.sh` with `RESEARCH_CUDA_VISIBLE_DEVICES=0,1` and `RESEARCH_DRY_RUN=true` resolved `nproc_per_node=2`
+- A full parser/runtime launch is still blocked in this local environment because `trl` is not installed and there is no `deepspeed` binary available.

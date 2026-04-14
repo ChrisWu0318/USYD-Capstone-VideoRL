@@ -64,18 +64,9 @@ class GRPOScriptArguments(ScriptArguments):
         default = None,
         metadata = {"help": "Path to experiment YAML config (e.g. configs/ablation_d2_kl.yaml)"}  # [FIX-1] metadate → metadata
     )
-    use_vllm: Optional[bool] = field(
-        default=False,
-        metadata={"help": "Use vLLM colocate mode for generation (requires vllm >= 0.8.0). Shares all training GPUs for vLLM TP generation."},
-    )
-    vllm_tensor_parallel_size: Optional[int] = field(
-        default=4,
-        metadata={"help": "Tensor parallel size for vLLM colocate generation. Should match number of training GPUs."},
-    )
-    vllm_gpu_memory_utilization: Optional[float] = field(
-        default=0.3,
-        metadata={"help": "Fraction of GPU memory to allocate for vLLM KV cache (0.0-1.0). Lower values leave more room for training."},
-    )
+    # use_vllm and related vLLM launch options are inherited from TRL's
+    # ScriptArguments. Keeping a second local definition causes duplicate CLI
+    # registration before training even starts.
 
 
 def accuracy_reward(completions, solution, **kwargs):
