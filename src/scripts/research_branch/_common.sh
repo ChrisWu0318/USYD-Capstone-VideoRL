@@ -53,6 +53,36 @@ resolve_local_or_remote_ref() {
   printf '%s\n' "${raw_value}"
 }
 
+infer_gpu_count_from_visible_devices() {
+  local visible_devices="$1"
+  local compact_devices=""
+
+  compact_devices="${visible_devices// /}"
+  compact_devices="${compact_devices#,}"
+  compact_devices="${compact_devices%,}"
+
+  if [[ -z "${compact_devices}" ]]; then
+    fail "Cannot infer GPU count from an empty RESEARCH_CUDA_VISIBLE_DEVICES value."
+  fi
+
+  IFS=',' read -r -a device_array <<< "${compact_devices}"
+  printf '%s\n' "${#device_array[@]}"
+}
+
+resolve_nproc_per_node() {
+  if [[ -n "${RESEARCH_NPROC_PER_NODE:-}" ]]; then
+    printf '%s\n' "${RESEARCH_NPROC_PER_NODE}"
+    return 0
+  fi
+
+  if [[ -n "${RESEARCH_CUDA_VISIBLE_DEVICES:-}" ]]; then
+    infer_gpu_count_from_visible_devices "${RESEARCH_CUDA_VISIBLE_DEVICES}"
+    return 0
+  fi
+
+  printf '1\n'
+}
+
 run_research_training() {
   local stage_name="$1"
   local config_ref="$2"
@@ -69,6 +99,7 @@ run_research_training() {
   local output_dir=""
   local run_name=""
   local visible_devices=""
+  local resolved_nproc_per_node=""
   local report_to=""
   local max_steps=""
   local num_train_epochs=""
@@ -83,7 +114,8 @@ run_research_training() {
   timestamp="$(date +%Y%m%d-%H%M%S)"
   output_dir="${r1_root}/log/research_branch/${stage_name}/${experiment_label}-${git_commit}-${timestamp}"
   run_name="${experiment_label}-${git_commit}-${timestamp}"
-  visible_devices="${RESEARCH_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-0,1,2,3}}"
+  visible_devices="${RESEARCH_CUDA_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-0}}"
+  resolved_nproc_per_node="$(resolve_nproc_per_node)"
   report_to="${RESEARCH_REPORT_TO:-wandb}"
   max_steps="${RESEARCH_MAX_STEPS:-300}"
   num_train_epochs="${RESEARCH_NUM_TRAIN_EPOCHS:-1}"
@@ -102,6 +134,7 @@ run_research_training() {
   echo "[research_branch] dataset=${dataset_ref}"
   echo "[research_branch] deepspeed=${ds_config}"
   echo "[research_branch] mode=$([[ "${RESEARCH_USE_VLLM:-false}" == "true" ]] && echo 'vLLM colocate' || echo 'HF non-colocate')"
+  echo "[research_branch] resolved_nproc_per_node=${resolved_nproc_per_node}"
   echo "[research_branch] max_prompt_length=${RESEARCH_MAX_PROMPT_LENGTH:-16384}"
   echo "[research_branch] max_completion_length=${RESEARCH_MAX_COMPLETION_LENGTH:-768}"
   echo "[research_branch] num_generations=${RESEARCH_NUM_GENERATIONS:-4}"
@@ -114,7 +147,7 @@ run_research_training() {
 
   local torchrun_cmd=(
     torchrun
-    --nproc_per_node "${RESEARCH_NPROC_PER_NODE:-4}"
+    --nproc_per_node "${resolved_nproc_per_node}"
     --nnodes "${RESEARCH_NNODES:-1}"
     --node_rank "${RESEARCH_NODE_RANK:-0}"
     --master_addr "${RESEARCH_MASTER_ADDR:-127.0.0.1}"
@@ -164,6 +197,11 @@ run_research_training() {
   echo "[research_branch] command:"
   printf '  %q' "${torchrun_cmd[@]}"
   printf '\n'
+
+  if [[ "${RESEARCH_DRY_RUN:-false}" == "true" ]]; then
+    echo "[research_branch] dry run requested; not launching training."
+    return 0
+  fi
 
   cd "${r1_root}"
   CUDA_VISIBLE_DEVICES="${visible_devices}" "${torchrun_cmd[@]}" 2>&1 | tee "${output_dir}/training_log.txt"
