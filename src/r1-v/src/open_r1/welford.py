@@ -16,7 +16,15 @@ Welford 在线算法 + Bayesian Prior warmup。
 """
 
 import math
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class _RunningStat:
+    count: int = 0
+    mean: float = 0.0
+    m2: float = 0.0
 
 
 class BayesianWelford:
@@ -38,6 +46,17 @@ class BayesianWelford:
         self.count: int = 0
         self.mean: float = 0.0
         self._m2: float = 0.0       # 偏差平方和 S_k
+        self.task_stats: Dict[str, _RunningStat] = {}
+
+    def _update_stat(self, stat: _RunningStat, value: float) -> None:
+        stat.count += 1
+        delta = value - stat.mean
+        stat.mean += delta / stat.count
+        delta2 = value - stat.mean
+        stat.m2 += delta * delta2
+
+    def _get_task_stat(self, task_type: str) -> _RunningStat:
+        return self.task_stats.setdefault(task_type, _RunningStat())
 
     def update(self, value: float) -> None:
         """单个观测值的在线更新 (Welford 算法核心)"""
@@ -47,10 +66,12 @@ class BayesianWelford:
         delta2 = value - self.mean
         self._m2 += delta * delta2
 
-    def update_batch(self, values: List[float]) -> None:
+    def update_batch(self, values: List[float], task_type: Optional[str] = None) -> None:
         """批量更新, 每个 training step 结束时调用"""
         for v in values:
             self.update(v)
+            if task_type is not None:
+                self._update_stat(self._get_task_stat(task_type), v)
 
     @property
     def variance(self) -> float:
@@ -66,6 +87,9 @@ class BayesianWelford:
     @property
     def std(self) -> float:
         return math.sqrt(self.variance)
+
+    def _posterior_variance(self, count: int, m2: float) -> float:
+        return (m2 + self.sigma_prior_sq) / (count + self.k_prior)
 
     def get_dynamic_bounds(
         self,
@@ -87,13 +111,15 @@ class BayesianWelford:
             (l_min, l_max) 元组
         """
         base_min, base_max = config.get_length_bounds(task_type)
+        task_stat = self.task_stats.get(task_type)
 
         # warmup 期间用静态值
-        if self.count < config.welford_warmup_steps:
+        if task_stat is None or task_stat.count < config.welford_warmup_steps:
             return (base_min, base_max)
 
         # 动态上界: 取 config 静态值和统计值的较大者
-        dynamic_max = max(base_max, self.mean + 2.0 * self.std)
+        task_std = math.sqrt(self._posterior_variance(task_stat.count, task_stat.m2))
+        dynamic_max = max(base_max, task_stat.mean + 2.0 * task_std)
         return (base_min, dynamic_max)
 
     def state_dict(self) -> dict:
@@ -104,6 +130,10 @@ class BayesianWelford:
             "M2": self._m2,
             "sigma_prior_sq": self.sigma_prior_sq,
             "k_prior": self.k_prior,
+            "task_stats": {
+                name: {"count": stat.count, "mean": stat.mean, "M2": stat.m2}
+                for name, stat in self.task_stats.items()
+            },
         }
 
     def load_state_dict(self, state: dict) -> None:
@@ -113,3 +143,10 @@ class BayesianWelford:
         self._m2 = state.get("M2") if state.get("M2") is not None else state.get("_m2", 0.0)
         self.sigma_prior_sq = state.get("sigma_prior_sq", self.sigma_prior_sq)
         self.k_prior = state.get("k_prior", self.k_prior)
+        self.task_stats = {}
+        for name, task_state in state.get("task_stats", {}).items():
+            self.task_stats[name] = _RunningStat(
+                count=task_state.get("count", 0),
+                mean=task_state.get("mean", 0.0),
+                m2=task_state.get("M2") if task_state.get("M2") is not None else task_state.get("_m2", 0.0),
+            )

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,7 +26,8 @@ from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser
 from datasets import Dataset, DatasetDict
 
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from rouge_score import rouge_scorer
+
+from research_logic import compute_accuracy_rewards
 
 
 @dataclass
@@ -79,107 +79,28 @@ class GRPOScriptArguments(ScriptArguments):
 
 
 def accuracy_reward(completions, solution, **kwargs):
-    
-    def extract_answer(text):
-        pattern = r'<answer>\s*(.*?)\s*</answer>'
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return ""
-
-    def normalize_number(num_str):
-        try:
-            num_str = num_str.replace(',', '')
-            return float(num_str)
-        except Exception as e:
-            print(f"Error converting '{num_str}' to float: {e}")
-            return None
-
-    def wer(reference, hypothesis):
-        ref_words = reference.split()
-        hyp_words = hypothesis.split()
-        m = len(ref_words)
-        n = len(hyp_words)
-        d = [[0]*(n+1) for _ in range(m+1)]
-        for i in range(m+1):
-            d[i][0] = i
-        for j in range(n+1):
-            d[0][j] = j
-        for i in range(1, m+1):
-            for j in range(1, n+1):
-                if ref_words[i-1] == hyp_words[j-1]:
-                    d[i][j] = d[i-1][j-1]
-                else:
-                    d[i][j] = 1 + min(d[i-1][j], d[i][j-1], d[i-1][j-1])
-        return d[m][n] / max(1, m)
-
-
-    def compute_rouge_score(reference, hypothesis, use_stemmer=True):
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=use_stemmer)
-        scores = scorer.score(reference, hypothesis)
-        average_fmeasure = (scores['rouge1'].fmeasure + scores['rouge2'].fmeasure + scores['rougeL'].fmeasure) / 3
-        return average_fmeasure
-    
-
-    question_type = kwargs['problem_type'][0]
-    
     contents = [completion[0]["content"] for completion in completions]
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+    problem_types = kwargs["problem_type"]
     rewards = []
+    try:
+        rewards = compute_accuracy_rewards(contents, solution, problem_types)
+    except Exception as e:
+        print(f"Error computing batch accuracy rewards: {e}")
+        rewards = [0.0] * len(contents)
 
-    for content, sol in zip(contents, solution):
-    
+    for content, sol, problem_type, reward in zip(contents, solution, problem_types, rewards):
         try:
-            output_ans = extract_answer(content)
-            gt_ans = extract_answer(sol)
-            if question_type == "multiple choice":
-                reward = 1.0 if output_ans.strip() == gt_ans.strip() else 0.0
-            elif question_type == "numerical":
-                gt_has_decimal = ("." in gt_ans) or ("," in gt_ans)
-                out_has_decimal = ("." in output_ans) or ("," in output_ans)
-                if gt_has_decimal != out_has_decimal:
-                    reward = 0.0
-                else:
-                    gt_number = normalize_number(gt_ans)
-                    out_number = normalize_number(output_ans)
-                    if gt_number is None or out_number is None:
-                        reward = 0.0
-                    else:
-                        reward = 1.0 if round(gt_number, 2) == round(out_number, 2) else 0.0
-            elif question_type == "OCR":
-                error_rate = wer(gt_ans, output_ans)
-                reward = 1 - error_rate
-                reward = max(0.0, min(1.0, reward))
-            elif question_type == "free-form":
-                score = compute_rouge_score(gt_ans, output_ans)
-                reward = max(0.0, min(1.0, score))
-            elif question_type == "regression":
-                gt_number = normalize_number(gt_ans)
-                out_number = normalize_number(output_ans)
-                if gt_number is None or out_number is None:
-                    reward = 0.0
-                else:
-                    rel_diff = (abs(out_number - gt_number) + 1e-9) / (abs(gt_number) + 1e-9)
-                    rel_diff = min(1.0, max(0.0, rel_diff))
-                    reward = 1 - rel_diff
-                # [FIX-2] 删除了原来在 if/else 外面的 3 行重复代码, 那 3 行在
-                # gt_number=None 时会 TypeError crash
-            else:
-                reward = 0.0
+            if os.getenv("DEBUG_MODE") == "true":
+                log_path = os.getenv("LOG_PATH")
+                # local_rank = int(os.getenv("LOCAL_RANK", 0))
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                    f.write(f"Content: {content}\n")
+                    f.write(f"Solution: {sol}\n")
         except Exception as e:
-            print(f"Error in reward_fn for question_type '{question_type}': {e}")
-            reward = 0.0
-    
-        rewards.append(reward)
-        
-        if os.getenv("DEBUG_MODE") == "true":
-            log_path = os.getenv("LOG_PATH")
-            # local_rank = int(os.getenv("LOCAL_RANK", 0))
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
-                f.write(f"Content: {content}\n")
-                f.write(f"Solution: {sol}\n")
-            
+            print(f"Error logging reward debug info for question_type '{problem_type}': {e}")
+
     return rewards
 
 
@@ -207,6 +128,19 @@ SYSTEM_PROMPT = (
 def main(script_args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+
+    if script_args.experiment_config:
+        script_args.experiment_config = os.path.abspath(script_args.experiment_config)
+        if not os.path.isfile(script_args.experiment_config):
+            raise FileNotFoundError(
+                f"--experiment_config points to a missing file: {script_args.experiment_config}"
+            )
+        print(f"[Research Config] Using explicit experiment config: {script_args.experiment_config}")
+    else:
+        print(
+            "[Research Config] LEGACY / NO EXPERIMENT CONFIG. "
+            "Canonical research runs on this branch must use an explicit --experiment_config YAML."
+        )
 
     if script_args.dataset_name.endswith('.json') or script_args.dataset_name.endswith('.jsonl'):
         dataset =  DatasetDict({"train": Dataset.from_json(script_args.dataset_name)})

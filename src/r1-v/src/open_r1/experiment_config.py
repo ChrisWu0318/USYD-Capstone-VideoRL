@@ -66,6 +66,7 @@ class ExperimentConfig:
     softplus_beta: float = 2.0              # β_s (Softplus 硬度)
     causal_mask_ratio: float = 0.5          # Mask 掉多少比例的帧
     causal_lazy_eval: bool = True           # 只对 R_acc=1 的样本计算
+    causal_lazy_eval_continuous_threshold: float = 0.95
     causal_reward_clip: float = 10.0        # R_causal 硬性上界 (防 Advantage 极化)
     causal_reward_scale: float = 0.5        # 叠加到 reward 时的缩放因子
 
@@ -132,6 +133,57 @@ class ExperimentConfig:
             f"  [D1] Causal Reward:     {'ON' if self.enable_causal_reward else 'OFF'}"
             + (f" (β_s={self.softplus_beta}, clip={self.causal_reward_clip})" if self.enable_causal_reward else ""),
             f"  [Override] len_control: {self.override_len_control if self.override_len_control is not None else 'unchanged (CLI)'}",
+        ]
+        return "\n".join(lines)
+
+    def runtime_summary(
+        self,
+        *,
+        config_path: Optional[str],
+        use_vllm: bool,
+        resolved_len_control: bool,
+    ) -> str:
+        if self.enable_causal_reward:
+            if self.causal_lazy_eval:
+                d1_behavior = (
+                    "ON, "
+                    "lazy eval: exact-match tasks require 1.0; "
+                    f"continuous tasks require >= {self.causal_lazy_eval_continuous_threshold:.2f}, "
+                    f"mask_ratio={self.causal_mask_ratio}, scale={self.causal_reward_scale}, clip={self.causal_reward_clip}"
+                )
+            else:
+                d1_behavior = (
+                    "ON, evaluate all samples, "
+                    f"mask_ratio={self.causal_mask_ratio}, scale={self.causal_reward_scale}, clip={self.causal_reward_clip}"
+                )
+        else:
+            d1_behavior = "OFF"
+
+        if self.enable_length_penalty:
+            d3_behavior = (
+                "ON, task-aware online bounds "
+                "(internal mapping: 'multiple choice' -> mcq, all other labels -> open_ended), "
+                f"warmup_steps={self.welford_warmup_steps}, len_control_resolved={resolved_len_control}"
+            )
+        else:
+            d3_behavior = f"OFF, len_control_resolved={resolved_len_control}"
+
+        d2_behavior = (
+            f"ON, per-token KL clamp max={self.kl_d_max}"
+            if self.enable_token_clipped_kl
+            else "OFF"
+        )
+
+        mode = "vLLM colocate" if use_vllm else "HF generate / non-colocate"
+        config_label = config_path or "LEGACY / NO EXPERIMENT CONFIG"
+
+        lines = [
+            "=== Effective Runtime Behavior ===",
+            f"  Config path: {config_label}",
+            f"  Generation mode: {mode}",
+            f"  [D1] Causal Reward: {d1_behavior}",
+            f"  [D2] Token-Clipped KL: {d2_behavior}",
+            f"  [D3] Length Penalty: {d3_behavior}",
         ]
         return "\n".join(lines)
 

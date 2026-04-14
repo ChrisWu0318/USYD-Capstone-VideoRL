@@ -14,6 +14,7 @@
 
 import os
 import textwrap
+import time
 import warnings
 import gc
 from collections import defaultdict
@@ -54,6 +55,7 @@ from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from qwen_vl_utils import process_vision_info
 from experiment_config import ExperimentConfig, task_type_from_problem_type
+from research_logic import should_evaluate_causal_reward
 from welford import BayesianWelford
 from temporal_mask import build_temporal_frame_mask  # [FIX-3] 帧级部分 mask
 
@@ -365,8 +367,12 @@ class Qwen2VLGRPOTrainer(Trainer):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
         # ---- Experiment Config (4D Regularization) ----
+        self.experiment_config_path = None
+        self.legacy_no_experiment_config = True
         if script_args is not None and getattr(script_args, 'experiment_config', None):
+            self.experiment_config_path = os.path.abspath(script_args.experiment_config)
             self.exp_config = ExperimentConfig.from_yaml(script_args.experiment_config)
+            self.legacy_no_experiment_config = False
         else:
             self.exp_config = ExperimentConfig()  # default = baseline, all flags OFF
 
@@ -390,13 +396,24 @@ class Qwen2VLGRPOTrainer(Trainer):
                 )
                 self.len_control = self.exp_config.override_len_control
 
-        if self.accelerator.is_main_process:
-            print(self.exp_config.summary())
-
         # ---- vLLM Colocate Initialization ----
         self.use_vllm = use_vllm
         self.vllm_tensor_parallel_size = vllm_tensor_parallel_size
         self.vllm_gpu_memory_utilization = vllm_gpu_memory_utilization
+        if self.accelerator.is_main_process:
+            print(self.exp_config.summary())
+            print(
+                self.exp_config.runtime_summary(
+                    config_path=self.experiment_config_path,
+                    use_vllm=self.use_vllm,
+                    resolved_len_control=self.len_control,
+                )
+            )
+            if self.legacy_no_experiment_config:
+                print(
+                    "[Research Config] WARNING: running without --experiment_config. "
+                    "This path is kept for compatibility only and is not the canonical research launch flow."
+                )
         if self.use_vllm:
             self._init_vllm(model_id, max_pixels, min_pixels)
 
@@ -539,6 +556,49 @@ class Qwen2VLGRPOTrainer(Trainer):
                             del sub_entry[k]
         return data
 
+    def _resolve_multimodal_path(self, sample: dict[str, Any]) -> str:
+        return os.path.join(os.getcwd(), "Video-R1-data", sample["path"].lstrip("/"))
+
+    def _log_skip_event(self, reason: str, *, sample: Optional[dict[str, Any]] = None, extra: Optional[str] = None) -> None:
+        self._metrics["skipped_batches"].append(1.0)
+        if sample is not None:
+            self._metrics["skipped_samples"].append(1.0)
+        message = f"[Batch Skip] {reason}"
+        if sample is not None:
+            message += f" | problem_id={sample.get('problem_id', 'unknown')}"
+            if "path" in sample:
+                message += f" | media_path={sample['path']}"
+        if extra:
+            message += f" | {extra}"
+        print(message)
+
+    def _zero_loss(self, model) -> torch.Tensor:
+        return next(model.parameters()).sum() * 0.0
+
+    def _skip_current_batch(self, model, reason: str, *, sample: Optional[dict[str, Any]] = None, extra: Optional[str] = None):
+        self._log_skip_event(reason, sample=sample, extra=extra)
+        return self._zero_loss(model)
+
+    def _expand_sample_field(self, inputs, key: str, repeat_count: int) -> list[Any]:
+        expanded = []
+        for example in inputs:
+            expanded.extend([example[key]] * repeat_count)
+        expected = len(inputs) * repeat_count
+        if len(expanded) != expected:
+            raise ValueError(
+                f"Expanded field '{key}' has {len(expanded)} entries, expected {expected} "
+                f"(batch={len(inputs)}, repeat={repeat_count})."
+            )
+        return expanded
+
+    def _validate_expected_batch_size(self, actual: int, *, num_samples: int, repeat_count: int, label: str) -> None:
+        expected = num_samples * repeat_count
+        if actual != expected:
+            raise ValueError(
+                f"{label} has unexpected size {actual}; expected {expected} "
+                f"(batch={num_samples}, repeat={repeat_count})."
+            )
+
 
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
     # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
@@ -548,35 +608,39 @@ class Qwen2VLGRPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-    
-        
+        step_start_time = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-
-                
-        
-        input_copy = copy.deepcopy(inputs[0]['prompt'])
-        
+        sample = inputs[0]
+        input_copy = copy.deepcopy(sample["prompt"])
         input_copy = self.remove_none_from_data(input_copy)
-        
-        if inputs[0]['data_type'] == 'image':
-            input_copy[0]['content'][0]['image'] = os.getcwd() + "/Video-R1-data" + inputs[0]['path'][1:] 
-        elif inputs[0]['data_type'] == 'video':
-            input_copy[0]['content'][0]['video'] = os.getcwd() + "/Video-R1-data" + inputs[0]['path'][1:] 
-            
+        resolved_media_path = self._resolve_multimodal_path(sample)
+        if not os.path.exists(resolved_media_path):
+            return self._skip_current_batch(
+                model,
+                "missing multimodal input; skipping invalid sample",
+                sample=sample,
+                extra=f"resolved_path={resolved_media_path}",
+            )
+
+        if sample["data_type"] == "image":
+            input_copy[0]["content"][0]["image"] = resolved_media_path
+        elif sample["data_type"] == "video":
+            input_copy[0]["content"][0]["video"] = resolved_media_path
+
         try:
             image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
         except Exception as e:
-            print(f"process_vision_info error, using fixed data, {e}")
-            if inputs[0]['data_type'] == 'image':
-                input_copy[0]['content'][0]['image'] = os.getcwd() + "/Video-R1-data" + '/Math/Multimath-300k/17ff4c7d14c388134de02381b1fc2824.png'
-            elif inputs[0]['data_type'] == 'video':
-                input_copy[0]['content'][0]['video'] = os.getcwd() + "/Video-R1-data" + '/LLaVA-Video-178K/liwei_youtube_videos/videos/youtube_video_2024/ytb_7nRmsEw7nsE.mp4'
-                
-            image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
-        
-        
+            return self._skip_current_batch(
+                model,
+                "vision preprocessing failed; skipping invalid sample",
+                sample=sample,
+                extra=str(e),
+            )
+
         prompt_inputs = self.processing_class(
             text=copy.deepcopy(prompts_text),
             images=image_inputs,
@@ -738,9 +802,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             self._vllm_sleep()
 
             if os.getenv("DEBUG_MODE") == "true":
-                print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])
-                print('problem_id:', inputs[0]['problem_id'])
-                print('prompt_length:', prompt_length)
+                print("path:", resolved_media_path)
+                print("problem_id:", sample["problem_id"])
+                print("prompt_length:", prompt_length)
 
         else:
             # ---- Original HF generate path ----
@@ -767,9 +831,9 @@ class Qwen2VLGRPOTrainer(Trainer):
 
             # [FIX-7] Debug prints gated behind DEBUG_MODE
             if os.getenv("DEBUG_MODE") == "true":
-                print('path:', input_copy[0]['content'][0][inputs[0]['data_type']])   
-                print('problem_id:', inputs[0]['problem_id'])       
-                print('prompt_length:', prompt_length)
+                print("path:", resolved_media_path)
+                print("problem_id:", sample["problem_id"])
+                print("prompt_length:", prompt_length)
                 
         
         
@@ -795,16 +859,34 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
             if 'second_per_grid_ts' in prompt_inputs:
                 del prompt_inputs["second_per_grid_ts"]
-        
-        
-        
-        
+
+        self._validate_expected_batch_size(
+            completion_ids.size(0),
+            num_samples=len(inputs),
+            repeat_count=self.num_generations,
+            label="completion_ids",
+        )
+        self._validate_expected_batch_size(
+            prompt_completion_ids.size(0),
+            num_samples=len(inputs),
+            repeat_count=self.num_generations,
+            label="prompt_completion_ids",
+        )
+
         try:
             per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
         except Exception as e:
-            print(f"Error computing per_token_logps: {e}. Setting output to zero.")
-            per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
+            raise RuntimeError(
+                "Failed to compute per_token_logps with multimodal inputs. "
+                "Refusing to fall back to text-only logprob computation because that would corrupt research semantics."
+            ) from e
+        self._validate_expected_batch_size(
+            per_token_logps.size(0),
+            num_samples=len(inputs),
+            repeat_count=self.num_generations,
+            label="per_token_logps",
+        )
         
         # ============================================================== #
         # [FIX-3] D1: partial temporal frame mask (was: full zero-out)   #
@@ -839,9 +921,17 @@ class Qwen2VLGRPOTrainer(Trainer):
                         model, prompt_completion_ids, **masked_inputs
                     )
                     masked_per_token_logps = masked_per_token_logps[:, prompt_length - 1 :]
+                    self._validate_expected_batch_size(
+                        masked_per_token_logps.size(0),
+                        num_samples=len(inputs),
+                        repeat_count=self.num_generations,
+                        label="masked_per_token_logps",
+                    )
                 except Exception as e:
-                    print(f"[D1] Error computing masked logps: {e}. Skipping causal reward this step.")
-                    masked_per_token_logps = None
+                    raise RuntimeError(
+                        "[D1] Failed to compute masked multimodal log probabilities. "
+                        "Refusing to silently skip causal reward because that would change the configured experiment."
+                    ) from e
                 finally:
                     # [OOM-FIX] Free masked activation memory before moving on
                     del masked_inputs
@@ -859,10 +949,16 @@ class Qwen2VLGRPOTrainer(Trainer):
                         ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
                 ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
             except Exception as e:
-                print(f"Error computing ref_per_token_logps: {e}. Setting output to zero.")
-                with self.accelerator.unwrap_model(model).disable_adapter():
-                    ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids)
-                ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+                raise RuntimeError(
+                    "Failed to compute ref_per_token_logps with multimodal inputs. "
+                    "Refusing to fall back to text-only reference logprob computation because that would corrupt research semantics."
+                ) from e
+        self._validate_expected_batch_size(
+            ref_per_token_logps.size(0),
+            num_samples=len(inputs),
+            repeat_count=self.num_generations,
+            label="ref_per_token_logps",
+        )
 
         # Compute the KL divergence between the model and the reference model
         # [FIX-6] Note: x_clamped is the numerical-stability clamp (±10) on the log ratio,
@@ -897,9 +993,13 @@ class Qwen2VLGRPOTrainer(Trainer):
             ):
                 shuffled_reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                 for key in shuffled_reward_kwargs:
-                    for example in inputs:
-                        shuffled_reward_kwargs[key].extend([example[key]] * self.shuffled_num_generations)
+                    shuffled_reward_kwargs[key] = self._expand_sample_field(inputs, key, self.shuffled_num_generations)
                 shuffled_output_reward_func = reward_func(prompts=shuffled_prompts, completions=shuffled_completions, **shuffled_reward_kwargs)
+                if len(shuffled_output_reward_func) != len(shuffled_prompts):
+                    raise ValueError(
+                        f"Shuffled reward function {i} returned {len(shuffled_output_reward_func)} scores, "
+                        f"expected {len(shuffled_prompts)}."
+                    )
                 shuffled_rewards_per_func[:, i] = torch.tensor(shuffled_output_reward_func, dtype=torch.float32, device=device)
 
         
@@ -907,6 +1007,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
+        self._validate_expected_batch_size(
+            len(completions),
+            num_samples=len(inputs),
+            repeat_count=self.num_generations,
+            label="decoded completions",
+        )
             
         # Compute the rewards
         prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
@@ -916,11 +1022,15 @@ class Qwen2VLGRPOTrainer(Trainer):
         ):
             reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
             for key in reward_kwargs:
-                for example in inputs:
-                    reward_kwargs[key].extend([example[key]] * self.num_generations)
+                reward_kwargs[key] = self._expand_sample_field(inputs, key, self.num_generations)
             output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+            if len(output_reward_func) != len(prompts):
+                raise ValueError(
+                    f"Reward function {i} returned {len(output_reward_func)} scores, expected {len(prompts)}."
+                )
             rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-        
+
+        expanded_problem_types = self._expand_sample_field(inputs, "problem_type", self.num_generations)
 
         
         
@@ -933,11 +1043,11 @@ class Qwen2VLGRPOTrainer(Trainer):
             if acc_mean >= 0.8 * shuffled_acc_mean:
                 mask = temporal_rewards_per_func[:, 0] > 0.1
                 temporal_rewards_per_func[mask, 0] = temporal_rewards_per_func[mask, 0] + 0.3
-                temporal_rewards = torch.tensor([1.0]).to('cuda')
+                temporal_rewards = torch.tensor([1.0], device=device)
             else:
-                temporal_rewards = torch.tensor([0.0]).to('cuda')
+                temporal_rewards = torch.tensor([0.0], device=device)
         else:
-            temporal_rewards =  torch.tensor([0.5]).to('cuda')
+            temporal_rewards = torch.tensor([0.5], device=device)
         
         # Sum the rewards from all reward functions
         if self.temporal and video_inputs:
@@ -967,8 +1077,15 @@ class Qwen2VLGRPOTrainer(Trainer):
             accuracy_rewards_col = rewards_per_func[:, 0]  # accuracy reward column
             beta_s = self.exp_config.softplus_beta
             for i in range(len(rewards)):
-                # Lazy evaluation: only compute for correct answers
-                if accuracy_rewards_col[i].item() < 1.0:
+                problem_type = expanded_problem_types[i]
+                # Keep exact-match tasks strict while letting continuous tasks use the
+                # configured threshold when lazy evaluation is enabled.
+                if not should_evaluate_causal_reward(
+                    problem_type=problem_type,
+                    accuracy_reward=accuracy_rewards_col[i].item(),
+                    causal_lazy_eval=self.exp_config.causal_lazy_eval,
+                    continuous_threshold=self.exp_config.causal_lazy_eval_continuous_threshold,
+                ):
                     d1_num_skipped += 1
                     continue
                 d1_num_evaluated += 1
@@ -989,12 +1106,18 @@ class Qwen2VLGRPOTrainer(Trainer):
         length_penalties = torch.zeros_like(rewards)
         if self.exp_config.enable_length_penalty and self.welford is not None:
             completion_lengths = completion_mask.sum(dim=1)  # [batch * num_gen]
+            self._validate_expected_batch_size(
+                completion_lengths.size(0),
+                num_samples=len(inputs),
+                repeat_count=self.num_generations,
+                label="completion_lengths",
+            )
+            lengths_by_task = defaultdict(list)
             for i in range(len(rewards)):
-                # [FIX-8] Safe indexing: clamp sample_idx to valid range of inputs
-                sample_idx = min(i // self.num_generations, len(inputs) - 1)
-                problem_type = inputs[sample_idx].get('problem_type', '')
+                problem_type = expanded_problem_types[i]
                 task = task_type_from_problem_type(problem_type) if problem_type else 'open_ended'
                 length = completion_lengths[i].item()
+                lengths_by_task[task].append(length)
 
                 l_min, l_max = self.welford.get_dynamic_bounds(task, self.exp_config)
 
@@ -1004,8 +1127,10 @@ class Qwen2VLGRPOTrainer(Trainer):
                     length_penalties[i] = -self.exp_config.length_penalty_beta * (l_min - length)
 
             rewards = rewards + length_penalties
-            # Update Welford online statistics with this batch's lengths
-            self.welford.update_batch(completion_lengths.tolist())
+            # Update Welford online statistics with task-aware batches using the
+            # existing problem_type labels through an internal mcq/open_ended mapping.
+            for task, task_lengths in lengths_by_task.items():
+                self.welford.update_batch(task_lengths, task_type=task)
 
         # [FIX-7] Debug prints gated behind DEBUG_MODE (was: unconditional print)
         if os.getenv("DEBUG_MODE") == "true":
@@ -1087,7 +1212,9 @@ class Qwen2VLGRPOTrainer(Trainer):
             self._metrics["length_penalty_nonzero_ratio"].append(nonzero_ratio)
             self._metrics["welford_mean"].append(self.welford.mean)
             self._metrics["welford_std"].append(self.welford.std)
-        
+        self._metrics["step_compute_time_sec"].append(time.perf_counter() - step_start_time)
+        if torch.cuda.is_available():
+            self._metrics["cuda_max_memory_allocated_gb"].append(torch.cuda.max_memory_allocated() / (1024 ** 3))
 
         return loss
 
