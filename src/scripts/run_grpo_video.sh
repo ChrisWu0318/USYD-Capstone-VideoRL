@@ -1,7 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
 cd src/r1-v
 
 export DEBUG_MODE="true" # Enable Debug if you want to see the rollout of model during RL
 export LOG_PATH="./debug_log_2b.txt"
+
+: "${EXPERIMENT_CONFIG:?Set EXPERIMENT_CONFIG to an explicit experiment YAML, e.g. src/r1-v/configs/research_branch/ablation_baseline.yaml}"
+echo "[legacy launcher] EXPERIMENT_CONFIG=${EXPERIMENT_CONFIG}"
 
 # For resume training:  --resume_from_checkpoint Model_Path \
 # Set temporal to choose between T-GRPO and GRPO, and len_control to enable or disable the length control reward.
@@ -38,4 +44,5 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node="4" \
     --beta 0.04 \
     --max_grad_norm 5 \
     --save_only_model false \
+    --experiment_config "${EXPERIMENT_CONFIG}" \
     --num_generations 8  # number of outputs G in grpo, reduce it would lead to faster training and smaller memory cost but higher variance  

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # ============================================================================
 # run_grpo_vllm_colocate.sh
 # vLLM Colocate Mode: All 4 GPUs used for BOTH training (ZeRO-3 DP) and
@@ -21,6 +22,9 @@ if [ ! -d "$OUTPUT_DIR" ]; then
 fi
 RUN_NAME="Qwen2.5-VL-7B-GRPO-vLLM-Colocate"
 DS_CONFIG="local_scripts/zero3.json"
+
+: "${EXPERIMENT_CONFIG:?Set EXPERIMENT_CONFIG to an explicit experiment YAML, e.g. src/r1-v/configs/research_branch/ablation_baseline.yaml}"
+echo "[legacy launcher] EXPERIMENT_CONFIG=${EXPERIMENT_CONFIG}"
 
 # Key difference from server mode: NO extra GPU needed.
 # All 4 GPUs participate in both training (DeepSpeed ZeRO-3) and generation (vLLM TP=4).
@@ -62,5 +66,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --use_vllm true \
     --vllm_tensor_parallel_size 4 \
     --vllm_gpu_memory_utilization 0.3 \
+    --experiment_config "${EXPERIMENT_CONFIG}" \
     --report_to wandb \
     2>&1 | tee "${OUTPUT_DIR}/training_log.txt"

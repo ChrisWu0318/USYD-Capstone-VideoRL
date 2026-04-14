@@ -1,0 +1,30 @@
+# Smoke test: verify config wiring, reward logic, D1/D2/D3 activation, and
+# early training stability with the smallest practical budget.
+
+experiment_name: smoke_d1_d2_d3
+experiment_tag: research-smoke-v1
+description: "Smoke test with D1+D2+D3 enabled for wiring and reward-path validation"
+seed: 42
+
+enable_token_clipped_kl: true
+kl_d_max: 5.0
+
+enable_length_penalty: true
+length_min_mcq: 50
+length_max_mcq: 256
+length_min_open: 200
+length_max_open: 600
+length_penalty_alpha: 0.001
+length_penalty_beta: 0.0005
+welford_sigma_prior: 100.0
+welford_k_prior: 50
+welford_warmup_steps: 50
+override_len_control: false
+
+enable_causal_reward: true
+softplus_beta: 2.0
+causal_mask_ratio: 0.5
+causal_lazy_eval: true
+causal_lazy_eval_continuous_threshold: 0.95
+causal_reward_clip: 10.0
+causal_reward_scale: 0.5

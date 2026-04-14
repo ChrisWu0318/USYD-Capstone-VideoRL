@@ -1,0 +1,10 @@
+# Baseline T-GRPO control for the research branch.
+
+experiment_name: ablation_baseline
+experiment_tag: research-ablation-baseline-v1
+description: "Baseline T-GRPO control with no D1/D2/D3 modifications enabled"
+seed: 42
+
+enable_token_clipped_kl: false
+enable_length_penalty: false
+enable_causal_reward: false

@@ -1,0 +1,22 @@
+# D3-only ablation.
+
+experiment_name: ablation_d3
+experiment_tag: research-ablation-d3-v1
+description: "D3 only: task-aware online length penalty"
+seed: 42
+
+enable_token_clipped_kl: false
+
+enable_length_penalty: true
+length_min_mcq: 50
+length_max_mcq: 256
+length_min_open: 200
+length_max_open: 600
+length_penalty_alpha: 0.001
+length_penalty_beta: 0.0005
+welford_sigma_prior: 100.0
+welford_k_prior: 50
+welford_warmup_steps: 50
+override_len_control: false
+
+enable_causal_reward: false

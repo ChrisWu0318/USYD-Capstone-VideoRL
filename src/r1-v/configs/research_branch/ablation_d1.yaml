@@ -1,0 +1,17 @@
+# D1-only ablation.
+
+experiment_name: ablation_d1
+experiment_tag: research-ablation-d1-v1
+description: "D1 only: soft-truncated counterfactual causal reward"
+seed: 42
+
+enable_token_clipped_kl: false
+enable_length_penalty: false
+
+enable_causal_reward: true
+softplus_beta: 2.0
+causal_mask_ratio: 0.5
+causal_lazy_eval: true
+causal_lazy_eval_continuous_threshold: 0.95
+causal_reward_clip: 10.0
+causal_reward_scale: 0.5

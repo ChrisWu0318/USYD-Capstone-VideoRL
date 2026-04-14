@@ -1,0 +1,12 @@
+# D2-only ablation.
+
+experiment_name: ablation_d2
+experiment_tag: research-ablation-d2-v1
+description: "D2 only: per-token clipped KL penalty"
+seed: 42
+
+enable_token_clipped_kl: true
+kl_d_max: 5.0
+
+enable_length_penalty: false
+enable_causal_reward: false

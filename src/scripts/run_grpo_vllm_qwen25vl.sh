@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 
 
 cd src/r1-v
@@ -15,6 +16,9 @@ if [ ! -d "$OUTPUT_DIR" ]; then
 fi
 RUN_NAME="Qwen2.5-VL-7B-Video-GRPO"
 DS_CONFIG="local_scripts/zero3.json"  
+
+: "${EXPERIMENT_CONFIG:?Set EXPERIMENT_CONFIG to an explicit experiment YAML, e.g. src/r1-v/configs/research_branch/ablation_baseline.yaml}"
+echo "[legacy launcher] EXPERIMENT_CONFIG=${EXPERIMENT_CONFIG}"
 
 # Set temporal to choose between T-GRPO and GRPO, and len_control to enable or disable the length control reward.
 # NOTE: you are expected to use X + 1 cards for X training proc and 1 vLLM proc 
@@ -58,4 +62,5 @@ CUDA_VISIBLE_DEVICES="0,1,2,3,4" torchrun \
     --vllm_device "cuda:4" \
     --vllm_gpu_memory_utilization 0.7 \
     --deepspeed ${DS_CONFIG} \
+    --experiment_config "${EXPERIMENT_CONFIG}" \
     2>&1 | tee "${OUTPUT_DIR}/training_log.txt"
