@@ -356,11 +356,18 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         self.model_accepts_loss_kwargs = False
 
+        self.ref_model_placement_mode = "disabled"
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
-                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                if use_vllm:
+                    self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+                    self.ref_model_placement_mode = "deepspeed-managed"
+                else:
+                    self.ref_model.eval()
+                    self.ref_model_placement_mode = "cpu-staged-per-step"
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+                self.ref_model_placement_mode = f"accelerator-eval:{self.accelerator.device}"
 
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
@@ -414,6 +421,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "[Research Config] WARNING: running without --experiment_config. "
                     "This path is kept for compatibility only and is not the canonical research launch flow."
                 )
+            print(f"[Ref Model] Placement mode: {self.ref_model_placement_mode}")
         if self.use_vllm:
             self._init_vllm(model_id, max_pixels, min_pixels)
 
@@ -598,6 +606,40 @@ class Qwen2VLGRPOTrainer(Trainer):
                 f"{label} has unexpected size {actual}; expected {expected} "
                 f"(batch={num_samples}, repeat={repeat_count})."
             )
+
+    def _get_module_device(self, module) -> Optional[torch.device]:
+        try:
+            return next(module.parameters()).device
+        except (StopIteration, AttributeError, TypeError):
+            pass
+        try:
+            return next(module.buffers()).device
+        except (StopIteration, AttributeError, TypeError):
+            return None
+
+    def _materialize_ref_model_for_forward(self, target_device: torch.device) -> bool:
+        if self.ref_model is None or self.ref_model_placement_mode != "cpu-staged-per-step":
+            return False
+        current_device = self._get_module_device(self.ref_model)
+        if current_device is None or current_device == target_device:
+            return False
+        if current_device.type != "cpu":
+            raise RuntimeError(
+                f"Expected CPU-staged ref_model before multimodal reference forward, got {current_device}."
+            )
+        self.ref_model = self.ref_model.to(target_device)
+        self.ref_model.eval()
+        if self.accelerator.is_main_process:
+            print(f"[Ref Model] Materialized on {target_device} for multimodal reference forward.")
+        return True
+
+    def _restore_ref_model_after_forward(self, moved_for_forward: bool) -> None:
+        if not moved_for_forward or self.ref_model is None or self.ref_model_placement_mode != "cpu-staged-per-step":
+            return
+        self.ref_model = self.ref_model.to("cpu")
+        self.ref_model.eval()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
@@ -941,8 +983,10 @@ class Qwen2VLGRPOTrainer(Trainer):
                     model.train()
 
         with torch.inference_mode():
+            ref_model_moved_for_forward = False
             try:
                 if self.ref_model is not None:
+                    ref_model_moved_for_forward = self._materialize_ref_model_for_forward(prompt_completion_ids.device)
                     ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs)
                 else:
                     with self.accelerator.unwrap_model(model).disable_adapter():
@@ -953,6 +997,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "Failed to compute ref_per_token_logps with multimodal inputs. "
                     "Refusing to fall back to text-only reference logprob computation because that would corrupt research semantics."
                 ) from e
+            finally:
+                self._restore_ref_model_after_forward(ref_model_moved_for_forward)
         self._validate_expected_batch_size(
             ref_per_token_logps.size(0),
             num_samples=len(inputs),
