@@ -359,7 +359,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.ref_model_placement_mode = "disabled"
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
-                if use_vllm:
+                if use_vllm or is_deepspeed_zero3_enabled():
+                    # ZeRO-3 partitions parameters into 1-D shards across ranks.
+                    # prepare_deepspeed() installs the gather hooks so forward
+                    # passes reconstruct full-rank tensors on the fly.  Without
+                    # this, a naive .to(device) + forward hits
+                    # "RuntimeError: 'weight' must be 2-D".
                     self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
                     self.ref_model_placement_mode = "deepspeed-managed"
                 else:
@@ -982,7 +987,10 @@ class Qwen2VLGRPOTrainer(Trainer):
                     # [FIX-4] Restore training mode
                     model.train()
 
-        with torch.inference_mode():
+        # Use torch.no_grad() instead of torch.inference_mode() because
+        # DeepSpeed ZeRO-3 gather hooks need to write tensor metadata during
+        # parameter reconstruction across ranks — inference_mode() blocks this.
+        with torch.no_grad():
             ref_model_moved_for_forward = False
             try:
                 if self.ref_model is not None:
