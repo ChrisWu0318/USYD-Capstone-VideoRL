@@ -366,6 +366,11 @@ class Qwen2VLGRPOTrainer(Trainer):
                     # passes reconstruct full-rank tensors on the fly.  Without
                     # this, a naive .to(device) + forward hits
                     # "RuntimeError: 'weight' must be 2-D".
+                    # The ref model was loaded on CPU to avoid OOM.  Move it to
+                    # this rank's device before DeepSpeed wraps it — at this
+                    # point the training model is already ZeRO-3 partitioned so
+                    # temporarily holding the full ref model is safe on A100s.
+                    self.ref_model = self.ref_model.to(self.accelerator.device)
                     self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
                     self.ref_model_placement_mode = "deepspeed-managed"
                 else:
