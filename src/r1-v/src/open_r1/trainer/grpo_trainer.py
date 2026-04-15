@@ -236,23 +236,32 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Reference model
         self._ref_model_is_zero3 = is_deepspeed_zero3_enabled()
         if self._ref_model_is_zero3:
-            # [OOM-FIX] Load ref_model to CPU first to avoid the 14GB spike when
-            # from_pretrained places the full 7B model on one GPU before DeepSpeed
-            # shards it. Do NOT use device_map (incompatible with ZeRO-3).
-            # prepare_deepspeed() below will properly shard and manage it.
-            ref_init_kwargs = dict(model_init_kwargs)
-            ref_init_kwargs["low_cpu_mem_usage"] = False
-            ref_init_kwargs.pop("device_map", None)
-            ref_init_kwargs.pop("use_cache", None)
-            if "Qwen2-VL" in model_id:
-                self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
-            elif "Qwen2.5-VL" in model_id:
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
-            elif "Aria" in model_id:
-                self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
-            else:
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
-            self.ref_model = self.ref_model.cpu()  # ensure CPU before DeepSpeed takes over
+            # [OOM-FIX] Load ref model with full-rank parameters on CPU.
+            # We temporarily suppress the ZeRO-3 config so from_pretrained
+            # does NOT partition weights into 1-D shards.  This lets us use
+            # cpu-staged placement (CPU → GPU for forward → CPU after forward)
+            # which keeps the ref model OFF the GPU during backward/optimizer
+            # steps — critical for fitting in limited GPU memory.
+            import transformers.integrations.deepspeed as _ds_int
+            _saved_zero3_config = _ds_int._hf_deepspeed_config_weak_ref
+            _ds_int._hf_deepspeed_config_weak_ref = None
+            try:
+                ref_init_kwargs = dict(model_init_kwargs)
+                ref_init_kwargs["low_cpu_mem_usage"] = True
+                ref_init_kwargs.pop("device_map", None)
+                ref_init_kwargs.pop("use_cache", None)
+                if "Qwen2-VL" in model_id:
+                    self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
+                elif "Qwen2.5-VL" in model_id:
+                    self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
+                elif "Aria" in model_id:
+                    self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
+                else:
+                    self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **ref_init_kwargs)
+            finally:
+                _ds_int._hf_deepspeed_config_weak_ref = _saved_zero3_config
+            self.ref_model = self.ref_model.cpu()
+            self.ref_model.eval()
         elif peft_config is None:
             self.ref_model = create_reference_model(model)
         else:
@@ -360,20 +369,17 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.ref_model_placement_mode = "disabled"
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
-                if use_vllm or self._ref_model_is_zero3:
-                    # ZeRO-3 partitions parameters into 1-D shards across ranks.
-                    # prepare_deepspeed() installs the gather hooks so forward
-                    # passes reconstruct full-rank tensors on the fly.  Without
-                    # this, a naive .to(device) + forward hits
-                    # "RuntimeError: 'weight' must be 2-D".
-                    # The ref model was loaded on CPU to avoid OOM.  Move it to
-                    # this rank's device before DeepSpeed wraps it — at this
-                    # point the training model is already ZeRO-3 partitioned so
-                    # temporarily holding the full ref model is safe on A100s.
+                if use_vllm:
+                    # vLLM colocate keeps ref model on GPU permanently.
                     self.ref_model = self.ref_model.to(self.accelerator.device)
                     self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
                     self.ref_model_placement_mode = "deepspeed-managed"
                 else:
+                    # CPU-staged: ref model lives on CPU, moves to GPU only
+                    # for the forward pass, then back to CPU.  This keeps
+                    # GPU memory free during backward / optimizer step.
+                    # The ref model was loaded with ZeRO-3 suppressed so its
+                    # parameters are full-rank (not 1-D shards).
                     self.ref_model.eval()
                     self.ref_model_placement_mode = "cpu-staged-per-step"
             else:
