@@ -234,7 +234,8 @@ class Qwen2VLGRPOTrainer(Trainer):
             model = get_peft_model(model, peft_config)
 
         # Reference model
-        if is_deepspeed_zero3_enabled():
+        self._ref_model_is_zero3 = is_deepspeed_zero3_enabled()
+        if self._ref_model_is_zero3:
             # [OOM-FIX] Load ref_model to CPU first to avoid the 14GB spike when
             # from_pretrained places the full 7B model on one GPU before DeepSpeed
             # shards it. Do NOT use device_map (incompatible with ZeRO-3).
@@ -359,7 +360,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.ref_model_placement_mode = "disabled"
         if self.ref_model is not None:
             if self.is_deepspeed_enabled:
-                if use_vllm or is_deepspeed_zero3_enabled():
+                if use_vllm or self._ref_model_is_zero3:
                     # ZeRO-3 partitions parameters into 1-D shards across ranks.
                     # prepare_deepspeed() installs the gather hooks so forward
                     # passes reconstruct full-rank tensors on the fly.  Without
