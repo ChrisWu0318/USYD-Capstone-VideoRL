@@ -97,3 +97,14 @@
   - `smoke_test_single_gpu.sh` with `RESEARCH_DRY_RUN=true` resolved `nproc_per_node=1`
   - `smoke_test.sh` with `RESEARCH_CUDA_VISIBLE_DEVICES=0,1` and `RESEARCH_DRY_RUN=true` resolved `nproc_per_node=2`
 - A full parser/runtime launch is still blocked in this local environment because `trl` is not installed and there is no `deepspeed` binary available.
+
+## Follow-up Patch: Multimodal Ref-Model Device Placement
+- `src/r1-v/src/open_r1/trainer/grpo_trainer.py`
+  - Added a narrow ref-model placement mode log on startup so rank 0 reports how the reference model will run for the current job.
+  - For non-vLLM DeepSpeed smoke/standard training, the reference model is no longer left on CPU when the trainer immediately needs a multimodal CUDA forward for `ref_per_token_logps`.
+  - The trainer now materializes the CPU-staged reference model onto the current rank device only for the reference forward, then restores it to CPU afterward.
+  - Existing research-integrity behavior is unchanged: there is still no text-only fallback for multimodal reference logprob computation.
+
+## Follow-up Validation: Ref-Model Placement
+- `python -m py_compile src/r1-v/src/open_r1/trainer/grpo_trainer.py`
+- Full multimodal smoke execution still requires the target Runpod environment with model weights and DeepSpeed installed.
