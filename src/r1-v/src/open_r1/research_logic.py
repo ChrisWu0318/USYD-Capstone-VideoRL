@@ -46,8 +46,18 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return distances[m][n] / max(1, m)
 
 
+_rouge_scorer_instance = None
+
+
+def _get_rouge_scorer(use_stemmer: bool = True):
+    global _rouge_scorer_instance
+    if _rouge_scorer_instance is None:
+        _rouge_scorer_instance = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=use_stemmer)
+    return _rouge_scorer_instance
+
+
 def compute_rouge_score(reference: str, hypothesis: str, use_stemmer: bool = True) -> float:
-    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=use_stemmer)
+    scorer = _get_rouge_scorer(use_stemmer)
     scores = scorer.score(reference, hypothesis)
     return (scores["rouge1"].fmeasure + scores["rouge2"].fmeasure + scores["rougeL"].fmeasure) / 3
 
@@ -60,8 +70,8 @@ def compute_accuracy_reward_for_sample(content: str, solution: str, problem_type
         return 1.0 if output_ans.strip() == gt_ans.strip() else 0.0
 
     if problem_type == "numerical":
-        gt_has_decimal = ("." in gt_ans) or ("," in gt_ans)
-        out_has_decimal = ("." in output_ans) or ("," in output_ans)
+        gt_has_decimal = "." in gt_ans
+        out_has_decimal = "." in output_ans
         if gt_has_decimal != out_has_decimal:
             return 0.0
         gt_number = normalize_number(gt_ans)

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import re
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Optional
@@ -143,16 +144,6 @@ def main(script_args, training_args, model_args):
         dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
 
 
-    # Format into conversation
-    def make_conversation(example):
-        return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
-            ],
-        }
-
-    
     QUESTION_TEMPLATE = (
         "{Question}\n"
         "Please think about this question as if you were a human pondering deeply. "
@@ -169,34 +160,6 @@ def main(script_args, training_args, model_args):
         "regression": " Please provide the numerical value (e.g., 42 or 3.14) within the <answer> </answer> tags."
     }
 
-    def make_conversation_image(example):
-        
-        return {
-            "prompt": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
-                    ],
-                },
-            ],
-        }
-    
-        
-    def make_conversation_video(example):
-        return {
-            "prompt": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "video"},
-                        {"type": "text", "text": QUESTION_TEMPLATE.format(Question=example["problem"])},
-                    ],
-                },
-            ],
-    }
-        
     def make_conversation_image_and_video(example):
         if example["problem_type"] == 'multiple choice':
             question = example['problem'] + "Options:\n"

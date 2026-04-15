@@ -259,7 +259,7 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Processing class
         if processing_class is None:
-            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id or True:
+            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Aria" in model_id:
                 processing_class = AutoProcessor.from_pretrained(model_id)
                 pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.pad_token_id = pad_token_id
@@ -1103,14 +1103,13 @@ class Qwen2VLGRPOTrainer(Trainer):
     
         
         if self.len_control:
-            mem_rewards = [0] * self.num_generations
             mask = rewards_per_func[:, 0] > 0.1
-            lenth_list = completion_mask.sum(1)
+            length_list = completion_mask.sum(1)
             selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
                     
-            if len(selected_indices) > 1:     
+            if len(selected_indices) > 1:
                 for idx in selected_indices:
-                    if 320 <= lenth_list[idx] <= 512:
+                    if 320 <= length_list[idx] <= 512:
                         rewards[idx] += 0.2
         
         # [D1] Soft-Truncated Counterfactual Causal Reward
