@@ -120,9 +120,9 @@ SYSTEM_PROMPT = (
 def main(script_args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
-    use_vllm = bool(getattr(training_args, "use_vllm", False))
-    vllm_tensor_parallel_size = int(getattr(training_args, "vllm_tensor_parallel_size", 1))
-    vllm_gpu_memory_utilization = float(getattr(training_args, "vllm_gpu_memory_utilization", 0.3))
+    use_vllm = bool(getattr(training_args, "use_vllm", False) or False)
+    vllm_tensor_parallel_size = int(getattr(training_args, "vllm_tensor_parallel_size", 1) or 1)
+    vllm_gpu_memory_utilization = float(getattr(training_args, "vllm_gpu_memory_utilization", 0.3) or 0.3)
 
     if script_args.experiment_config:
         script_args.experiment_config = os.path.abspath(script_args.experiment_config)
