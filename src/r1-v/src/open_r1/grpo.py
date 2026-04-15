@@ -119,6 +119,9 @@ SYSTEM_PROMPT = (
 def main(script_args, training_args, model_args):
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    use_vllm = bool(getattr(training_args, "use_vllm", False))
+    vllm_tensor_parallel_size = int(getattr(training_args, "vllm_tensor_parallel_size", 1))
+    vllm_gpu_memory_utilization = float(getattr(training_args, "vllm_gpu_memory_utilization", 0.3))
 
     if script_args.experiment_config:
         script_args.experiment_config = os.path.abspath(script_args.experiment_config)
@@ -229,7 +232,7 @@ def main(script_args, training_args, model_args):
     trainer_cls = Qwen2VLGRPOTrainer
     # vLLM colocate mode is now built into Qwen2VLGRPOTrainer via use_vllm flag.
     # No separate trainer class needed.
-    print("using: ", trainer_cls, " | use_vllm:", script_args.use_vllm)
+    print("using: ", trainer_cls, " | use_vllm:", use_vllm)
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
@@ -243,9 +246,9 @@ def main(script_args, training_args, model_args):
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
-        use_vllm=script_args.use_vllm,
-        vllm_tensor_parallel_size=script_args.vllm_tensor_parallel_size,
-        vllm_gpu_memory_utilization=script_args.vllm_gpu_memory_utilization,
+        use_vllm=use_vllm,
+        vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
     )
     
     if training_args.resume_from_checkpoint is not None:

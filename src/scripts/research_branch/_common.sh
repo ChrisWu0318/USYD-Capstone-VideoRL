@@ -167,7 +167,7 @@ run_research_training() {
     --bf16 true
     --logging_steps "${RESEARCH_LOGGING_STEPS:-1}"
     --gradient_checkpointing true
-    --attn_implementation "${RESEARCH_ATTN_IMPLEMENTATION:-flash_attention_2}"
+    --attn_implementation "${RESEARCH_ATTN_IMPLEMENTATION:-sdpa}"
     --min_pixels "${RESEARCH_MIN_PIXELS:-3136}"
     --max_pixels "${RESEARCH_MAX_PIXELS:-501760}"
     --num_train_epochs "${num_train_epochs}"
