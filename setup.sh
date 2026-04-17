@@ -7,8 +7,12 @@
 set -euo pipefail
 
 echo "[setup] Verifying NVIDIA driver and CUDA toolkit..."
-nvidia-smi | head -5 || { echo "ERROR: nvidia-smi failed"; exit 1; }
-nvcc --version | tail -3 || echo "WARN: nvcc not found, flash-attn may fail to build"
+if ! nvidia-smi > /dev/null 2>&1; then
+  echo "ERROR: nvidia-smi failed"
+  exit 1
+fi
+nvidia-smi 2>&1 | head -n 5 || true
+nvcc --version 2>&1 | tail -n 3 || echo "WARN: nvcc not found, flash-attn may fail to build"
 
 # 1) PyTorch 2.7+ with CUDA 12.8 — has sm_120 kernels for Blackwell.
 echo "[setup] Installing torch 2.7 + cu128..."
