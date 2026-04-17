@@ -20,9 +20,11 @@ pip install --upgrade pip
 pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
 
 # 2) Core repo (editable). setup.py now requires torch>=2.7, deepspeed>=0.16.5, vllm>=0.8.5.
-echo "[setup] Installing r1-v..."
+# Install core deps only — [dev]/[eval] pull lighteval + black + pytest which we
+# don't need for training and can have their own dep conflicts.
+echo "[setup] Installing r1-v (core deps only, no dev/eval extras)..."
 cd src/r1-v
-pip install -e ".[dev]"
+pip install -e .
 cd -
 
 # 3) Logging and eval extras.
