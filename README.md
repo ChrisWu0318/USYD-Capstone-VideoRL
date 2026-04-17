@@ -77,19 +77,58 @@ GPU count is auto-detected from `RESEARCH_CUDA_VISIBLE_DEVICES`.
 
 | Experiment | Minimum GPUs | Recommended |
 |-----------|-------------|-------------|
-| Smoke test | 4x A100 80GB | 4x A100 80GB |
-| Ablation | 4x A100 80GB | 4-8x A100 80GB |
-| Formal training | 8x A100 80GB | 8x A100 80GB |
+| Smoke test | 4x A100 80GB / 4x RTX Pro 6000 96GB | same |
+| Ablation | 4x A100 80GB / 4x RTX Pro 6000 | 4–8x A100 80GB |
+| Formal training | 8x A100 80GB / 4x RTX Pro 6000 | 8x A100 80GB |
+
+> **Pro 6000 note:** 2-GPU runs OOM when the ref model materializes on top of
+> step-1 activations (~67 GB + 14 GB ref > 96 GB). ZeRO-3 with 4 shards is the
+> confirmed path; vLLM colocate may further reduce rollout memory but sm_120
+> support is still being verified — see `docs/experiments/pro6000_archive.md`.
 
 ## Getting Started
 
-See the [Smoke Test Guide](https://github.com/ChrisWu0318/USYD-Capstone-VideoRL/wiki) or ask your team lead for the one-click setup document.
-
-1. Clone repo and checkout branch `D4_algorithm_oom_fix_local`
-2. Install dependencies (conda + pip, see setup guide)
-3. Download model weights and dataset
+### A100 path
+1. Checkout branch `D4_algorithm_oom_fix_local`
+2. Install deps (see setup guide)
+3. Download model + dataset
 4. Run `smoke_test.sh` to validate
 5. Proceed to ablation / formal training
+
+### RTX Pro 6000 (Blackwell, sm_120) path
+1. Checkout branch `blackwell_rtx6000_compat`
+2. Follow `docs/experiments/autodl_pro6000_setup.md` (14-step guide) — pins
+   torch 2.9.1+cu128, flash-attn 2.8.3 prebuilt wheel, deepspeed ≥0.16.5
+3. See `docs/experiments/pro6000_archive.md` for full rationale, pitfalls,
+   dataset extraction commands, and verification scripts
+
+## Status & Next Steps (2026-04-18, `blackwell_rtx6000_compat`)
+
+**Validated on 2× RTX Pro 6000 (Blackwell, sm_120, CUDA 12.8):**
+- ✅ Full dependency stack installs clean (torch 2.9.1, flash-attn 2.8.3,
+  deepspeed 0.18.9, bitsandbytes ≥0.45, transformers 4.51.3)
+- ✅ Model loads (Qwen2.5-VL-7B-COT-SFT, 4 shards)
+- ✅ Dataset loader + CLEVRER video path resolution work
+- ✅ **Smoke step 1 metrics match parent branch within tolerance:**
+  `kl=0.000539`, `welford_mean=192.0`, `length_penalty_mean=-0.004`,
+  `causal_reward_mean=0.0` — algorithm is numerically consistent on Blackwell
+- ⚠️ **2-GPU OOMs at step 2** (ref model materialize on top of ~67 GB
+  step-1 activations); need 4-GPU ZeRO-3 to shard model state/grad/optim
+
+**Next:**
+1. Re-run smoke + `budget_probe` on 4× Pro 6000 (ZeRO-3 should shrink
+   per-GPU model state from ~28 GB → ~7 GB and halve ref materialize cost)
+2. Investigate vLLM 0.8.5+ Blackwell (sm_120) compatibility in isolation
+   — if rollout works, switch to colocate mode for 3-5× faster generation
+3. Run the 8 ablations + formal_full once either path is stable
+
+## Tracking Docs
+
+| Doc | Purpose |
+|-----|---------|
+| `docs/experiments/autodl_pro6000_setup.md` | Step-by-step AutoDL reproduction (14 steps) |
+| `docs/experiments/blackwell_runbook.md` | Dependency delta matrix + risk table |
+| `docs/experiments/pro6000_archive.md` | **Full archive** — what we did, why, and all pitfalls |
 
 ## Acknowledgement
 

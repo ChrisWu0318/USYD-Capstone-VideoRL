@@ -68,7 +68,7 @@ source /etc/network_turbo
 
 ```bash
 cd /root/autodl-tmp
-git clone -b blackwell_rtx6000_compat <your-github-repo-url> USYD-Capstone-VideoRL
+git clone -b blackwell_rtx6000_compat https://github.com/ChrisWu0318/USYD-Capstone-VideoRL USYD-Capstone-VideoRL
 cd USYD-Capstone-VideoRL
 ```
 
@@ -86,8 +86,11 @@ pod 应该出 `NVIDIA RTX PRO 6000 Blackwell Workstation Edition`。
 ```bash
 pip install --upgrade pip
 
-pip install torch==2.9.1 torchvision==0.24.1 \
-  --index-url https://download.pytorch.org/whl/cu128
+
+unset http_proxy https_proxy all_proxy
+  pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128
+  
+pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
 验证：
@@ -200,7 +203,8 @@ EOF
 wandb login
 
 # HuggingFace（训练脚本里读 model / dataset）
-huggingface-cli login
+# 新版 CLI 叫 hf，huggingface-cli 已废弃
+hf auth login
 ```
 
 ## Step 13 — 下模型和数据集
@@ -209,15 +213,38 @@ huggingface-cli login
 # 模型
 cd /root/autodl-tmp
 mkdir -p models && cd models
-huggingface-cli download Video-R1/Qwen2.5-VL-7B-COT-SFT \
-  --local-dir ./Qwen2.5-VL-7B-COT-SFT --local-dir-use-symlinks False
+# 1) 关掉代理 — hf-mirror 国内直连就是最快的，不需要走 turbo
+unset http_proxy https_proxy all_proxy
+
+# 2) 确认 hf_transfer 装了
+pip show hf_transfer >/dev/null 2>&1 || pip install hf_transfer
+
+# 3) 显式再走一遍，不依赖 .bashrc
+HF_ENDPOINT=https://hf-mirror.com \
+HF_HUB_ENABLE_HF_TRANSFER=1 \
+hf download Video-R1/Qwen2.5-VL-7B-COT-SFT \
+  --local-dir ./Qwen2.5-VL-7B-COT-SFT
 
 # 数据集（Smoke test 用 10 条的子集即可）
 cd /root/autodl-tmp
 mkdir -p datasets && cd datasets
-huggingface-cli download Video-R1/Video-R1-data --repo-type dataset \
-  --local-dir ./Video-R1-data --local-dir-use-symlinks False
+HF_ENDPOINT=https://hf-mirror.com \
+HF_HUB_ENABLE_HF_TRANSFER=1 \
+hf download Video-R1/Video-R1-data --repo-type dataset \
+  --local-dir ./Video-R1-data
+  
+cd /root/autodl-tmp/datasets
+  HF_ENDPOINT=https://hf-mirror.com HF_HUB_ENABLE_HF_TRANSFER=1 \
+  hf download Video-R1/Video-R1-data --repo-type dataset \
+    --local-dir ./Video-R1-data
 ```
+
+> 如果 hf-mirror 当前很慢，备选走 modelscope（阿里镜像）：
+> ```bash
+> pip install modelscope
+> modelscope download --model Video-R1/Qwen2.5-VL-7B-COT-SFT \
+>   --local_dir /root/autodl-tmp/models/Qwen2.5-VL-7B-COT-SFT
+> ```
 
 ## Step 14 — Smoke test
 
