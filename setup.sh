@@ -6,6 +6,17 @@
 # ============================================================================
 set -euo pipefail
 
+# On AutoDL-style pods the system disk (/root) and data disk (/root/autodl-tmp)
+# are separate filesystems. If PIP_CACHE_DIR lives on the data disk but TMPDIR
+# stays on the system disk, some wheel installs (notably flash-attn) fail with
+# 'Invalid cross-device link' when moving the downloaded wheel into the cache.
+# Pin TMPDIR to the same volume as the pip cache if the cache is on autodl-tmp.
+if [[ "${PIP_CACHE_DIR:-}" == /root/autodl-tmp/* && -z "${TMPDIR:-}" ]]; then
+  export TMPDIR=/root/autodl-tmp/tmp
+  mkdir -p "$TMPDIR"
+  echo "[setup] TMPDIR set to $TMPDIR (same filesystem as PIP_CACHE_DIR)"
+fi
+
 echo "[setup] Verifying NVIDIA driver and CUDA toolkit..."
 if ! nvidia-smi > /dev/null 2>&1; then
   echo "ERROR: nvidia-smi failed"
