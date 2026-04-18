@@ -444,29 +444,70 @@ smoke test 必须跟父分支 A100 跑出来的指标对齐（数量级一致即
 
 ---
 
-## 9. 实验路线图
+## 9. 实验路线图（2026-04-18 预算优化版）
 
-下面是从 smoke test 到正式训练的完整顺序。每一步是前一步的**硬前置**。
+**硬件前提**：3× RTX Pro 6000（96 GB, sm_120, CUDA 12.8），AutoDL 计费
+5.98 RMB/卡·小时 → 整机 17.94 RMB/h。
 
-| 阶段 | 脚本 | 步数 | 预计耗时（2× Pro 6000）| 验收标准 |
+**验证基线**（2026-04-18 budget_probe 实测，3 卡 ZeRO-3，filtered 8220 样本）：
+- step 时间 ~70 s（含 I/O）/ ~63 s（纯 compute），稳定无漂移
+- 峰值显存 84.7 GB（< 96 GB，留 11 GB headroom）
+- KL 0.0005 → 0.0013 单调增长，无爆炸
+- D1/D2/D3 三路都在按设计开/关，reward 上行，grad_norm 2–5 稳定
+
+### 阶段 1：Baseline gate（必跑）
+
+| 项 | 值 |
+|---|---|
+| 脚本 | `ablation_baseline.sh`（`ablation_baseline.yaml`，D1/D2/D3 全关） |
+| 步数 | `RESEARCH_MAX_STEPS=200` |
+| 耗时 | ~3.9 h（200 × 70s） |
+| 成本 | ~70 RMB |
+| 验收 | loss 下降、reward 上行、显存稳、无 NaN/OOM；200 步末尾 checkpoint 可评测 |
+| 放行条件 | baseline 正常 → 进入阶段 2；异常 → 回查再跑，不动正则项 |
+
+### 阶段 2：4 组 ablation 串行（gate 过后再跑）
+
+| 组 | 脚本 | YAML | 预计耗时 | 成本 |
 |---|---|---|---|---|
-| ① Smoke | `smoke_test.sh` | 3 | ~15 min | §8 指标全对齐 |
-| ② Budget probe | `budget_probe.sh` | 20 | ~1–2 h | loss 下降趋势健康，无 OOM，显存占用 < 90% |
-| ③ Ablation × 8 | `ablation_*.sh`（8 个 YAML）| 各 300 | 各 ~6–8 h | 每组 wandb 曲线正常，结果可对比 |
-| ④ Formal full | `formal_full.sh` | 1200 | ~25–30 h | 完整跑完，checkpoint 可评测 |
+| D1 only | `ablation_d1_only.sh` | `ablation_d1.yaml` | ~3.9 h | ~70 RMB |
+| D2 only | `ablation_d2_only.sh` | `ablation_d2.yaml` | ~3.9 h | ~70 RMB |
+| D3 only | `ablation_d3_only.sh` | `ablation_d3.yaml` | ~3.9 h | ~70 RMB |
+| D1+D2+D3 | `ablation_d1_d2_d3.sh` | `ablation_d1_d2_d3.yaml` | ~3.9 h | ~70 RMB |
 
-> **8 个 ablation YAML**：`ablation_baseline` / `ablation_d1` / `ablation_d2` / `ablation_d3` / `ablation_d1_d2` / `ablation_d1_d3` / `ablation_d2_d3` / `ablation_d1_d2_d3`
-> 位置：`src/r1-v/configs/research_branch/`
+**均统一** `RESEARCH_MAX_STEPS=200`，`RESEARCH_SAVE_STEPS=100`，`RESEARCH_REPORT_TO=wandb`。
 
-**运行示例**（smoke）：
+### 阶段 3（可选，仅为论文补图）：pair-wise × 3
+
+`ablation_d1_d2` / `ablation_d1_d3` / `ablation_d2_d3`，每组 ~3.9 h / ~70 RMB。
+若阶段 2 四条曲线已能支撑核心结论（additive / best component），**跳过**。
+
+### 总预算
+
+| 方案 | 总时长 | 总成本 |
+|---|---|---|
+| 最小闭环（阶段 1 + 2 = 5 runs × 200 步） | ~19.5 h | **~350 RMB** |
+| 含 pair-wise（+3 runs） | ~31 h | ~560 RMB |
+| 原计划（8 × 300 + formal 1200） | ~77 h | ~1380 RMB |
+
+**正式 full run 暂不列入** — 200 步 ablation 结果收敛后再决定是否补 1200 步
+formal（单次 ~23 h / ~415 RMB）。
+
+### 运行示例
+
 ```bash
-RESEARCH_CUDA_VISIBLE_DEVICES=0,1 \
+# 阶段 1：baseline
+RESEARCH_CUDA_VISIBLE_DEVICES=0,1,2 \
+RESEARCH_MAX_STEPS=200 \
+RESEARCH_SAVE_STEPS=100 \
+RESEARCH_REPORT_TO=wandb \
 RESEARCH_MODEL_NAME_OR_PATH=/root/autodl-tmp/models/Qwen2.5-VL-7B-COT-SFT \
-RESEARCH_DATASET_NAME=/root/autodl-tmp/datasets/Video-R1-data/smoke_test_10.json \
-bash src/scripts/research_branch/smoke_test.sh 2>&1 | tee /root/autodl-tmp/smoke_test.log
+RESEARCH_DATASET_NAME=/root/autodl-tmp/datasets/Video-R1-data/Video-R1-260k.filtered.json \
+bash src/scripts/research_branch/ablation_baseline.sh 2>&1 | tee /root/autodl-tmp/logs/baseline.log
 ```
 
-GPU 数量由 `RESEARCH_CUDA_VISIBLE_DEVICES` 自动推导（`_common.sh` 里 `resolve_nproc_per_node`），2 卡 / 4 卡不用改脚本。
+GPU 数量由 `RESEARCH_CUDA_VISIBLE_DEVICES` 自动推导（`_common.sh` 里
+`resolve_nproc_per_node`），2 卡 / 3 卡 / 4 卡不用改脚本。
 
 ---
 
@@ -505,3 +546,123 @@ src/r1-v/setup.py                           （改依赖 pin）
 
 算法代码（`grpo.py` / `grpo_trainer.py` / `temporal_mask.py` / `research_logic.py`
 / `experiment_config.py` 等）**全部未改动**，与父分支完全一致。
+
+---
+
+## 12. AutoDL Pod 迁移 & budget_probe 期间的新踩坑（2026-04-18）
+
+从 2× → 3× Pro 6000 换 pod 后新 surface 的问题，按排查顺序记录。每条都含
+根因和修复动作，方便下次迁机直接照做。
+
+### 12.1 DeepSpeed 0.18.9 在 sm_120 上 muon kernel 编译失败
+**症状**：`setup.sh` 装完后 import deepspeed 段错误；trace 指向 muon CUDA 扩展。
+**根因**：0.18.x 把 muon optimizer 的 CUDA 源码标为必编译，对 sm_120
+arch flag 处理有 bug。
+**修复**：固定到 `deepspeed==0.16.9`（仍有 sm_120 kernels，还没引入 muon 必编路径）：
+```bash
+pip install "deepspeed==0.16.9" --no-build-isolation --force-reinstall --no-deps
+```
+**后续**：`setup.sh` 的 `"deepspeed>=0.16.5"` 上限需要在下一个 commit 改成
+`>=0.16.5,<0.17`，避免 pip 自动拉到 0.18。
+
+### 12.2 `pip install --force-reinstall` 不带 `--no-deps` 会把 torch 升到 2.11
+**症状**：重装某个包后，`python -c "import torch; print(torch.__version__)"`
+显示 2.11 —— flash-attn 2.8.3 wheel 直接 ABI mismatch。
+**根因**：很多上游包（deepspeed、bitsandbytes）声明 `torch`（无上限）。
+`--force-reinstall` 会重新解依赖把 torch 也升了。
+**修复**：任何单包 reinstall 必须带 `--no-deps`。需要真的补依赖时，先用
+`pip check` 看谁缺，再定点装。
+
+### 12.3 `WANDB_DISABLED=true` 触发 WandbCallback 的坏路径
+**症状**：设 `WANDB_DISABLED=true` 启动后仍然报 wandb 相关 TypeError。
+**根因**：transformers 的 WandbCallback 读取 `WANDB_DISABLED` 的逻辑在
+4.51.3 上有 bug，即使禁用仍然尝试 import/初始化。
+**修复**：改用 `WANDB_MODE=disabled`（wandb 原生支持的变量，走 wandb 自己的
+noop 后端，不经过 WandbCallback 的禁用分支）。
+
+### 12.4 transformers 4.51.3 把 `Trainer._save_checkpoint(metrics=...)` 删了
+**症状**：`budget_probe` 跑到 `save_steps` 时 `TypeError: _save_checkpoint()
+got an unexpected keyword argument 'metrics'`。
+**根因**：父分支按旧签名调 `super()._save_checkpoint(model, trial, metrics=metrics)`；
+4.51.3 签名变成 `(self, model, trial)`。
+**修复**：`src/r1-v/src/open_r1/trainer/grpo_trainer.py:538` 去掉 `metrics` kwarg：
+```python
+super()._save_checkpoint(model, trial)
+```
+已提交（`7068af3`）。
+
+### 12.5 数据根目录是硬编码的，symlink 必须放在 `src/r1-v/Video-R1-data`
+**症状**：数据集 JSON 路径正确、文件也能打开，但 `Dataset.__getitem__`
+里解析出的视频路径 FileNotFound。
+**根因**：`grpo_trainer.py:586` 用
+`os.path.join(os.getcwd(), "Video-R1-data", sample["path"].lstrip("/"))`
+拼路径，而 `_common.sh:206` 在启动前 `cd src/r1-v`。所以数据根**必须**
+出现在 `src/r1-v/Video-R1-data/`，仓库根放 symlink 没用。
+**修复**：
+```bash
+ln -sfn /root/autodl-tmp/datasets/Video-R1-data \
+        /root/autodl-tmp/USYD-Capstone-VideoRL/src/r1-v/Video-R1-data
+```
+
+### 12.6 Video-R1-260k 97% 媒体缺失 → ZeRO-3 grad size mismatch
+**症状**：symlink 对了以后立刻报
+`RuntimeError: 0 != 1505280 Cannot reduce scatter gradients whose size is
+not same as the params`，发生在 step 0 的 reduce_scatter。
+**根因**：per_device_batch_size=1，某些 rank 抽到的样本视频文件 0 字节或缺失，
+dataloader 返回空 tensor → forward 出 0-sized grad → ZeRO-3 和其他 rank 的
+参数 size mismatch。我们下载的 260k 数据集只补了 CLEVRER，其余
+（Math / NeXT-QA / Knowledge / ArxivQA / LLaVA）大部分子目录是空的。
+**修复**：启动前**预过滤** JSON，只保留媒体文件存在且非空的样本：
+```python
+import json, os
+src = "/root/autodl-tmp/datasets/Video-R1-data/Video-R1-260k.json"
+dst = "/root/autodl-tmp/datasets/Video-R1-data/Video-R1-260k.filtered.json"
+root = "/root/autodl-tmp/datasets/Video-R1-data"
+with open(src) as f: data = json.load(f)
+kept = []
+for item in data:
+    p = item.get("path", "").lstrip("./")
+    full = os.path.join(root, p)
+    if os.path.isfile(full) and os.path.getsize(full) > 0:
+        kept.append(item)
+with open(dst, "w") as f: json.dump(kept, f)
+print(f"kept: {len(kept)} / {len(data)}")
+```
+结果：8220 / 263071（3.1%）。启动时 `RESEARCH_DATASET_NAME=...filtered.json`。
+
+### 12.7 wandb API key 新格式（`wandb_v1_...`, 86 字符）需要 wandb ≥ 0.20
+**症状**：`wandb login` 报 `API key must be 40 characters long, yours was 86`。
+**根因**：2026 年 wandb 切到新 token 格式，前缀 `wandb_v1_`，总长 86。
+老 wandb 0.19.1 仍然按旧 40 字符校验。
+**修复**：
+```bash
+pip install --upgrade "wandb>=0.20.0"
+# 或直接设环境变量绕开 login 校验
+export WANDB_API_KEY=wandb_v1_xxxxxxxxxxxx...
+```
+
+### 12.8 AutoDL pod 迁移会清空 `/root/autodl-tmp/` 的大文件
+**症状**：从旧 pod 克隆 image 到新 pod 后，模型权重和 wandb 缓存不见。
+**根因**：AutoDL 只保留容器的 image 层，`autodl-tmp` 是数据盘，换 pod
+就是新盘。
+**修复**：迁 pod checklist：
+1. 重新下载模型权重（走 modelscope / 本地冷备）
+2. 重新 `wandb login`
+3. 重建数据 symlink（见 12.5）
+4. 跑 smoke 之前先 `python -c "import torch, flash_attn, deepspeed; ..."`
+   确认依赖还在
+
+### 12.9 budget_probe 验证通过的基线数字（供后续对比）
+
+3× Pro 6000，ZeRO-3，filtered 8220 样本，20 步实测：
+
+| 指标 | 值 | 备注 |
+|---|---|---|
+| step 时间（end-to-end） | ~70 s | 含 dataloader I/O |
+| step 时间（compute-only） | ~63 s | trainer 内部计时 |
+| 峰值显存 | 84.7 GB / 96 GB | 11 GB headroom |
+| KL | 0.0005 → 0.0013 | 单调，无爆炸 |
+| welford_mean | 197 → 225 | 在线统计收敛 |
+| reward_mean | 缓慢上行 | 正常 |
+| grad_norm | 2–5 | 稳定 |
+| D1/D2/D3 | 全部按配置 fire | 算法分支正确 |
