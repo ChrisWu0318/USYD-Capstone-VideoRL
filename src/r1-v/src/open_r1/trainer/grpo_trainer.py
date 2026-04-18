@@ -535,7 +535,8 @@ class Qwen2VLGRPOTrainer(Trainer):
     # ------------------------------------------------------------------ #
     def _save_checkpoint(self, model, trial, metrics=None):
         """Save Welford state alongside the normal checkpoint."""
-        super()._save_checkpoint(model, trial, metrics=metrics)
+        # transformers 4.51.3 dropped the `metrics` kwarg from Trainer._save_checkpoint
+        super()._save_checkpoint(model, trial)
         if self.welford is not None and self.accelerator.is_main_process:
             ckpt_dir = self._get_output_dir(trial)
             welford_path = os.path.join(ckpt_dir, "welford_state.pt")
