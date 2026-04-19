@@ -599,16 +599,22 @@ class Qwen2VLGRPOTrainer(Trainer):
         print(message)
 
     def _zero_loss(self, model) -> torch.Tensor:
-        # Under ZeRO-3 every rank must produce grads for the same parameter set,
-        # otherwise reduce_scatter crashes with "0 != N Cannot reduce scatter
-        # gradients". Touching every param here makes backward populate a
-        # zero .grad on every shard, shape-consistent with the normal path.
+        # ZeRO-3 registers its pre-forward gather / post-backward partition
+        # hooks only when parameters are touched via ``module.forward``. Pure
+        # Python ``p.sum()`` bypasses those hooks, so backward produces
+        # zero-numel grads and reduce_scatter crashes with
+        # "0 != N Cannot reduce scatter gradients".
+        #
+        # Run a minimal text-only forward through the wrapped model so the
+        # DeepSpeed hooks fire for every module touched by the text path, then
+        # scale the loss to zero. ``_coordinate_skip`` guarantees every rank
+        # takes this same branch in lock-step, so the set of touched params
+        # stays consistent across ranks and reduce_scatter has shape parity.
         device = next(model.parameters()).device
-        loss = torch.zeros((), device=device)
-        for p in model.parameters():
-            if p.requires_grad:
-                loss = loss + p.sum() * 0.0
-        return loss
+        dummy_input_ids = torch.tensor([[0]], dtype=torch.long, device=device)
+        dummy_attention_mask = torch.ones_like(dummy_input_ids)
+        outputs = model(input_ids=dummy_input_ids, attention_mask=dummy_attention_mask)
+        return outputs.logits.sum() * 0.0
 
     def _coordinate_skip(self, local_skip: bool) -> bool:
         # Any rank wanting to skip forces every rank to skip, so no rank enters
