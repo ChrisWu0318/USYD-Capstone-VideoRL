@@ -599,7 +599,26 @@ class Qwen2VLGRPOTrainer(Trainer):
         print(message)
 
     def _zero_loss(self, model) -> torch.Tensor:
-        return next(model.parameters()).sum() * 0.0
+        # Under ZeRO-3 every rank must produce grads for the same parameter set,
+        # otherwise reduce_scatter crashes with "0 != N Cannot reduce scatter
+        # gradients". Touching every param here makes backward populate a
+        # zero .grad on every shard, shape-consistent with the normal path.
+        device = next(model.parameters()).device
+        loss = torch.zeros((), device=device)
+        for p in model.parameters():
+            if p.requires_grad:
+                loss = loss + p.sum() * 0.0
+        return loss
+
+    def _coordinate_skip(self, local_skip: bool) -> bool:
+        # Any rank wanting to skip forces every rank to skip, so no rank enters
+        # the full pipeline (which contains collectives) while peers bail out.
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return local_skip
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        flag = torch.tensor([1 if local_skip else 0], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
 
     def _skip_current_batch(self, model, reason: str, *, sample: Optional[dict[str, Any]] = None, extra: Optional[str] = None):
         self._log_skip_event(reason, sample=sample, extra=extra)
@@ -678,27 +697,33 @@ class Qwen2VLGRPOTrainer(Trainer):
         input_copy = copy.deepcopy(sample["prompt"])
         input_copy = self.remove_none_from_data(input_copy)
         resolved_media_path = self._resolve_multimodal_path(sample)
+        local_skip_reason: Optional[str] = None
+        local_skip_extra: Optional[str] = None
+        image_inputs = None
+        video_inputs = None
+        video_kwargs = None
+
         if not os.path.exists(resolved_media_path):
+            local_skip_reason = "missing multimodal input; skipping invalid sample"
+            local_skip_extra = f"resolved_path={resolved_media_path}"
+        else:
+            if sample["data_type"] == "image":
+                input_copy[0]["content"][0]["image"] = resolved_media_path
+            elif sample["data_type"] == "video":
+                input_copy[0]["content"][0]["video"] = resolved_media_path
+            try:
+                image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
+            except Exception as e:
+                local_skip_reason = "vision preprocessing failed; skipping invalid sample"
+                local_skip_extra = str(e)
+
+        if self._coordinate_skip(local_skip_reason is not None):
+            if local_skip_reason is not None:
+                return self._skip_current_batch(model, local_skip_reason, sample=sample, extra=local_skip_extra)
             return self._skip_current_batch(
                 model,
-                "missing multimodal input; skipping invalid sample",
+                "coordinated skip (peer rank had invalid sample)",
                 sample=sample,
-                extra=f"resolved_path={resolved_media_path}",
-            )
-
-        if sample["data_type"] == "image":
-            input_copy[0]["content"][0]["image"] = resolved_media_path
-        elif sample["data_type"] == "video":
-            input_copy[0]["content"][0]["video"] = resolved_media_path
-
-        try:
-            image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
-        except Exception as e:
-            return self._skip_current_batch(
-                model,
-                "vision preprocessing failed; skipping invalid sample",
-                sample=sample,
-                extra=str(e),
             )
 
         prompt_inputs = self.processing_class(
