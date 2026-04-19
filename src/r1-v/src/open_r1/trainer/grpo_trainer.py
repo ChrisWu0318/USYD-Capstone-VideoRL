@@ -630,6 +630,17 @@ class Qwen2VLGRPOTrainer(Trainer):
         self._log_skip_event(reason, sample=sample, extra=extra)
         return self._zero_loss(model)
 
+    def _coordinate_all_have_video(self, local_has_video: bool) -> bool:
+        # D1 masked forward touches the vision encoder only for video samples.
+        # Under ZeRO-3 the submodule_order must match across ranks, so any rank
+        # without a video makes every rank skip D1 this step.
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return local_has_video
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        flag = torch.tensor([1 if local_has_video else 0], device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+        return bool(flag.item())
+
     def _expand_sample_field(self, inputs, key: str, repeat_count: int) -> list[Any]:
         expanded = []
         for example in inputs:
@@ -993,7 +1004,14 @@ class Qwen2VLGRPOTrainer(Trainer):
         #         measurement, then restore model.train()                #
         # ============================================================== #
         masked_per_token_logps = None
-        if self.exp_config.enable_causal_reward and video_inputs:
+        # Coordinate across ranks: D1 masked forward invokes the vision encoder,
+        # which only runs for video samples. If some ranks have video and others
+        # don't, their ZeRO-3 submodule_order diverges and reduce_scatter aborts
+        # ("disagreement on list length between rank0 and rankN: 256 vs 0").
+        # Gate D1 on ALL ranks having video this step; mixed batches drop D1.
+        local_has_video = bool(video_inputs)
+        all_have_video = self._coordinate_all_have_video(local_has_video)
+        if self.exp_config.enable_causal_reward and all_have_video:
             with torch.no_grad():
                 masked_inputs = {}
                 for k, v in prompt_inputs.items():
