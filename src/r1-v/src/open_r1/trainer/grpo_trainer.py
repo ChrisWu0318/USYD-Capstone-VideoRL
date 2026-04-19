@@ -728,13 +728,20 @@ class Qwen2VLGRPOTrainer(Trainer):
                 input_copy[0]["content"][0]["image"] = resolved_media_path
             elif sample["data_type"] == "video":
                 input_copy[0]["content"][0]["video"] = resolved_media_path
-                # Cap long videos to prevent vision encoder OOM.
-                # LLaVA-Video YouTube clips at default 2fps can exceed 60
-                # frames, blowing up SDP attention memory. 16 frames matches
-                # Video-R1 defaults. nframes and fps are mutually exclusive
-                # in qwen_vl_utils — remove fps if present.
+                # Cap frames + per-frame pixels to prevent vision encoder OOM.
+                # Qwen2.5-VL VisionAttention materializes an [1, N, N] bool
+                # mask (not flash-attn), so high-res 1080p+ LLaVA-Video clips
+                # blow up ref-model forward memory. Values match qwen_vl_utils
+                # native defaults / Video-R1 recipe (128*28*28 per frame,
+                # 128000*28*28*0.9 total). setdefault preserves dataset-
+                # supplied overrides; pop fps because it's mutually exclusive
+                # with nframes.
                 nframes_cap = int(os.environ.get("RESEARCH_VIDEO_NFRAMES_CAP", "16"))
+                max_pixels_cap = int(os.environ.get("RESEARCH_VIDEO_MAX_PIXELS", str(128 * 28 * 28)))
+                total_pixels_cap = int(os.environ.get("RESEARCH_VIDEO_TOTAL_PIXELS", str(int(128000 * 28 * 28 * 0.9))))
                 input_copy[0]["content"][0].setdefault("nframes", nframes_cap)
+                input_copy[0]["content"][0].setdefault("max_pixels", max_pixels_cap)
+                input_copy[0]["content"][0].setdefault("total_pixels", total_pixels_cap)
                 input_copy[0]["content"][0].pop("fps", None)
             try:
                 image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
