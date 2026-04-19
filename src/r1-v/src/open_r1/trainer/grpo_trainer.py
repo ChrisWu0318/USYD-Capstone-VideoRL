@@ -717,6 +717,14 @@ class Qwen2VLGRPOTrainer(Trainer):
                 input_copy[0]["content"][0]["image"] = resolved_media_path
             elif sample["data_type"] == "video":
                 input_copy[0]["content"][0]["video"] = resolved_media_path
+                # Cap long videos to prevent vision encoder OOM.
+                # LLaVA-Video YouTube clips at default 2fps can exceed 60
+                # frames, blowing up SDP attention memory. 16 frames matches
+                # Video-R1 defaults. nframes and fps are mutually exclusive
+                # in qwen_vl_utils — remove fps if present.
+                nframes_cap = int(os.environ.get("RESEARCH_VIDEO_NFRAMES_CAP", "16"))
+                input_copy[0]["content"][0].setdefault("nframes", nframes_cap)
+                input_copy[0]["content"][0].pop("fps", None)
             try:
                 image_inputs, video_inputs, video_kwargs = process_vision_info(input_copy, return_video_kwargs=True)
             except Exception as e:
