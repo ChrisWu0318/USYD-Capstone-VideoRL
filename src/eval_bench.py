@@ -18,6 +18,8 @@ BSZ = 64
 parser = argparse.ArgumentParser(description="Evaluation benchmark")
 parser.add_argument('--model_path', type=str, required=True, help="Path to the model")
 parser.add_argument('--file_name', type=str, required=True, help="Name of the file")
+parser.add_argument('--datasets', type=str, default='mvbench,tempcompass,videomme,videommmu,vsibench,mmvu',
+                    help="Comma-separated dataset names to evaluate (default: all)")
 args = parser.parse_args()
 
 MODEL_PATH = args.model_path
@@ -48,11 +50,15 @@ tokenizer.padding_side = "left"
 processor.tokenizer = tokenizer
 
 
-for dataset_name in ['mvbench','tempcompass','videomme','videommmu','vsibench','mmvu']:
+for dataset_name in args.datasets.split(','):
 
     OUTPUT_PATH = f"./src/r1-v/eval_results/eval_{dataset_name}_{file_name}_greedy_output.json"
     PROMPT_PATH = f"./src/r1-v/Evaluation/eval_{dataset_name}.json"
-    
+
+    if not os.path.exists(PROMPT_PATH):
+        print(f"SKIP {dataset_name}: {PROMPT_PATH} not found")
+        continue
+
     if PROMPT_PATH.endswith('.jsonl'):
         with open(PROMPT_PATH, "r", encoding="utf-8") as f:
             for line in f:
@@ -94,7 +100,7 @@ for dataset_name in ['mvbench','tempcompass','videomme','videommmu','vsibench','
             "content": [
                 {
                     "type": x['data_type'],
-                    x['data_type']: os.getcwd() + "/src/r1-v/Evaluation" + x['path'][1:]
+                    x['data_type']: os.getcwd() + "/src/r1-v/Evaluation/" + x['path'].lstrip('/')
                 },
                 {
                     "type": "text",
