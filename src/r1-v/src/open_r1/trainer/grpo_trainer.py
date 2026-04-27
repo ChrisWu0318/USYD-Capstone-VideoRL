@@ -1105,11 +1105,9 @@ class Qwen2VLGRPOTrainer(Trainer):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # [D2] Token-level clipped KL: cap each token's KL at D_max
-        if self.exp_config.enable_token_clipped_kl:
-            # [FIX-6] Save pre-clip KL for monitoring before D2 truncation modifies it
-            raw_per_token_kl = per_token_kl.detach().clone()
-            per_token_kl = per_token_kl.clamp(max=self.exp_config.kl_d_max)
+        # [v3] D2 removed. Log p(k>5) unconditionally for dead-zone monitoring.
+        # Compare against old D4-with-D2 trajectory: 5% → 32% over 362 steps.
+        p_k_gt_5 = (per_token_kl > 5.0).float().mean()
         
         if self.temporal and video_inputs:
             shuffled_completions = self.processing_class.batch_decode(shuffled_completion_ids, skip_special_tokens=True)
@@ -1187,15 +1185,17 @@ class Qwen2VLGRPOTrainer(Trainer):
             rewards = rewards_per_func.sum(dim=1)
     
         
-        if self.len_control:
-            mask = rewards_per_func[:, 0] > 0.1
-            length_list = completion_mask.sum(1)
-            selected_indices = torch.nonzero(mask, as_tuple=True)[0].tolist()
-                    
-            if len(selected_indices) > 1:
-                for idx in selected_indices:
-                    if 320 <= length_list[idx] <= 512:
-                        rewards[idx] += 0.2
+        # [v3] Layer 1: Video-R1 length bonus (positive incentive, vectorized)
+        # Controlled by experiment config, not --len_control CLI flag.
+        if self.exp_config.enable_length_bonus:
+            completion_lengths = completion_mask.sum(dim=1)
+            bonus_min = self.exp_config.length_bonus_min
+            bonus_max = self.exp_config.length_bonus_max
+            omega = self.exp_config.length_bonus_omega
+            correct_mask = rewards_per_func[:, 0] > 0.1
+            window_mask = (completion_lengths >= bonus_min) & (completion_lengths <= bonus_max)
+            bonus_mask = correct_mask & window_mask
+            rewards = rewards + omega * bonus_mask.float()
         
         # [D1] Soft-Truncated Counterfactual Causal Reward
         # For samples where accuracy_reward >= 1.0, measure how much the model
@@ -1231,41 +1231,65 @@ class Qwen2VLGRPOTrainer(Trainer):
             causal_rewards = causal_rewards.clamp(max=self.exp_config.causal_reward_clip)
             rewards = rewards + causal_rewards * self.exp_config.causal_reward_scale
 
-        # [D3] Task-Conditioned Piecewise Length Penalty
-        # Penalize outputs that are too long or too short for their task type
-        length_penalties = torch.zeros_like(rewards)
-        if self.exp_config.enable_length_penalty and self.welford is not None:
-            completion_lengths = completion_mask.sum(dim=1)  # [batch * num_gen]
-            self._validate_expected_batch_size(
-                completion_lengths.size(0),
-                num_samples=len(inputs),
-                repeat_count=self.num_generations,
-                label="completion_lengths",
-            )
-            lengths_by_task = defaultdict(list)
-            for i in range(len(rewards)):
-                problem_type = expanded_problem_types[i]
-                task = task_type_from_problem_type(problem_type) if problem_type else 'open_ended'
-                length = completion_lengths[i].item()
-                lengths_by_task[task].append(length)
-
-                l_min, l_max = self.welford.get_dynamic_bounds(task, self.exp_config)
-
-                if length > l_max:
-                    length_penalties[i] = -self.exp_config.length_penalty_alpha * (length - l_max)
-                elif length < l_min:
-                    length_penalties[i] = -self.exp_config.length_penalty_beta * (l_min - length)
-
-            rewards = rewards + length_penalties
-            # Update Welford online statistics with task-aware batches using the
-            # existing problem_type labels through an internal mcq/open_ended mapping.
-            for task, task_lengths in lengths_by_task.items():
-                self.welford.update_batch(task_lengths, task_type=task)
+        # [v3] Layer 2: DAPO Overlong Reward Shaping (smooth length cap, vectorized)
+        # Penalty ramps linearly from 0 at (L_max - L_buffer) to -penalty at L_max.
+        # With default config (L_max=768, buffer=256):
+        #   L ≤ 512:   0 penalty
+        #   512<L<768: penalty ramps from 0 to -1
+        #   L ≥ 768:   penalty = -1
+        # Mechanically orthogonal to Layer 1 bonus: bonus rewards correct in-window,
+        # OLS penalizes overlong responses regardless of correctness.
+        ols_penalties = torch.zeros_like(rewards)
+        if self.exp_config.enable_overlong_reward_shaping:
+            completion_lengths = completion_mask.sum(dim=1).float()
+            L_max = self.exp_config.overlong_max_response_length
+            L_buffer = self.exp_config.overlong_buffer_length
+            L_start = L_max - L_buffer
+            penalty_scale = self.exp_config.overlong_buffer_penalty
+            ols_active = (completion_lengths - L_start).clamp(min=0)
+            ols_penalties = -penalty_scale * (ols_active / L_buffer).clamp(max=1.0)
+            rewards = rewards + ols_penalties
 
         # [FIX-7] Debug prints gated behind DEBUG_MODE (was: unconditional print)
         if os.getenv("DEBUG_MODE") == "true":
             print(rewards)
             print(completion_mask.sum(1))
+
+        # [v3] Dynamic Sampling with T-GRPO joint filtering
+        # Per-step σ check: if σ_normal == 0 OR σ_shuffled == 0, skip this prompt.
+        # Joint rule preserves T-GRPO's paired contrastive structure.
+        ds_skipped = False
+        if self.exp_config.enable_dynamic_sampling:
+            # Assert single-prompt-per-step assumption
+            if rewards.shape[0] != self.num_generations:
+                raise RuntimeError(
+                    f"Dynamic Sampling assumes single-prompt-per-step batch, "
+                    f"got rewards.shape={rewards.shape}, expected ({self.num_generations},). "
+                    f"Set per_device_train_batch_size=1 or disable enable_dynamic_sampling."
+                )
+            sigma_normal = rewards.std()
+            if self.temporal and video_inputs:
+                shuffled_rewards_flat = shuffled_rewards_per_func.sum(dim=1)
+                sigma_shuffled = shuffled_rewards_flat.std()
+                should_skip = (sigma_normal == 0.0) or (sigma_shuffled == 0.0)
+            else:
+                sigma_shuffled = None
+                should_skip = (sigma_normal == 0.0)
+
+            if should_skip:
+                ds_skipped = True
+                self._metrics["ds_filtered"].append(1.0)
+                skip_reason = (
+                    f"σ_normal={sigma_normal.item():.4f}"
+                    + (f", σ_shuffled={sigma_shuffled.item():.4f}"
+                       if sigma_shuffled is not None else "")
+                )
+                if self._coordinate_skip(True):
+                    return self._skip_current_batch(
+                        model,
+                        "Dynamic Sampling: zero-std group filtered",
+                        extra=skip_reason,
+                    )
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1317,31 +1341,49 @@ class Qwen2VLGRPOTrainer(Trainer):
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
 
-        # [D2] KL diagnostics: track truncation ratio when clipping is enabled
-        if self.exp_config.enable_token_clipped_kl:
-            # [FIX-6] Use the pre-clip snapshot saved earlier (raw_per_token_kl)
-            # instead of recomputing from x_clamped to avoid confusion
-            trunc_ratio = (raw_per_token_kl > self.exp_config.kl_d_max).float().mean()
-            self._metrics["kl_truncation_ratio"].append(trunc_ratio.item())
-            self._metrics["kl_raw_max"].append(raw_per_token_kl.max().item())
+        # [v3] D2 dead-zone diagnostic (unconditional)
+        self._metrics["p_k_gt_5"].append(p_k_gt_5.item())
+
+        # [v3] KL tail diagnostics (unconditional; was gated behind D2 on)
+        kl_masked = per_token_kl[completion_mask.bool()].float()
+        self._metrics["kl_p95"].append(torch.quantile(kl_masked, 0.95).item())
+        self._metrics["kl_p99"].append(torch.quantile(kl_masked, 0.99).item())
+        self._metrics["kl_max"].append(per_token_kl.max().item())
+
+        # [v3] Dynamic Sampling diagnostics
+        if self.exp_config.enable_dynamic_sampling:
+            self._metrics["ds_filtered"].append(1.0 if ds_skipped else 0.0)
+            if not ds_skipped:
+                self._metrics["sigma_normal"].append(sigma_normal.item())
+                if sigma_shuffled is not None:
+                    self._metrics["sigma_shuffled"].append(sigma_shuffled.item())
+
+        # [v3] OLS diagnostics
+        if self.exp_config.enable_overlong_reward_shaping:
+            ols_active = (ols_penalties != 0).float().mean()
+            self._metrics["ols_active_rate"].append(ols_active.item())
+            if ols_active > 0:
+                self._metrics["ols_penalty_mean"].append(
+                    ols_penalties[ols_penalties != 0].mean().item()
+                )
+            else:
+                self._metrics["ols_penalty_mean"].append(0.0)
+
+        # [v3] Length bonus diagnostics
+        if self.exp_config.enable_length_bonus:
+            bonus_active = bonus_mask.float().mean()
+            self._metrics["bonus_active_rate"].append(bonus_active.item())
 
         # [D1] Causal reward diagnostics
         if self.exp_config.enable_causal_reward:
             self._metrics["causal_reward_mean"].append(causal_rewards.mean().item())
             self._metrics["causal_reward_max"].append(causal_rewards.max().item())
-            self._metrics["causal_reward_std"].append(causal_rewards.std().item())  # [FIX-3] track variance
+            self._metrics["causal_reward_std"].append(causal_rewards.std().item())
             total_d1 = d1_num_evaluated + d1_num_skipped
             self._metrics["causal_eval_ratio"].append(
                 d1_num_evaluated / max(total_d1, 1)
             )
 
-        # [D3] Length penalty diagnostics
-        if self.exp_config.enable_length_penalty:
-            self._metrics["length_penalty_mean"].append(length_penalties.mean().item())
-            nonzero_ratio = (length_penalties != 0).float().mean().item()
-            self._metrics["length_penalty_nonzero_ratio"].append(nonzero_ratio)
-            self._metrics["welford_mean"].append(self.welford.mean)
-            self._metrics["welford_std"].append(self.welford.std)
         self._metrics["step_compute_time_sec"].append(time.perf_counter() - step_start_time)
         if torch.cuda.is_available():
             self._metrics["cuda_max_memory_allocated_gb"].append(torch.cuda.max_memory_allocated() / (1024 ** 3))

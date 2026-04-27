@@ -81,8 +81,50 @@ class ExperimentConfig:
     override_len_control: Optional[bool] = None
 
     # ================================================================
+    # v3: DAPO Dynamic Sampling (with T-GRPO joint filtering)
+    # ================================================================
+    enable_dynamic_sampling: bool = False
+    filter_zero_std_groups: bool = True
+    oversample_factor: float = 1.5
+    dynamic_sampling_max_retries: int = 3
+    tgrpo_joint_filtering: bool = True
+
+    # ================================================================
+    # v3: DAPO Clip-Higher (asymmetric PPO clipping bounds)
+    # NOTE: Clip-Higher modifies PPO importance-sampling clipping.
+    # The current loss is REINFORCE (ratio=1.0, no importance sampling),
+    # so these fields are reserved for future use. They have NO effect
+    # on the current loss function.
+    # ================================================================
+    epsilon_low: float = 0.2
+    epsilon_high: float = 0.28
+
+    # ================================================================
+    # v3: Length control — two-layer orthogonal mechanism
+    # ================================================================
+    # Layer 1: Video-R1 length bonus (positive incentive)
+    enable_length_bonus: bool = False
+    length_bonus_min: int = 320
+    length_bonus_max: int = 512
+    length_bonus_omega: float = 0.2
+
+    # Layer 2: DAPO Overlong Reward Shaping (smooth length cap)
+    enable_overlong_reward_shaping: bool = False
+    overlong_max_response_length: int = 768
+    overlong_buffer_length: int = 256
+    overlong_buffer_penalty: float = 1.0
+
+    # ================================================================
     # 方法
     # ================================================================
+
+    def __post_init__(self):
+        """Validate config consistency after construction."""
+        if self.enable_token_clipped_kl:
+            raise ValueError(
+                "D2 (enable_token_clipped_kl) has been removed in v3. "
+                "Remove this flag from your YAML config."
+            )
 
     @classmethod
     def from_yaml(cls, path: str) -> "ExperimentConfig":
@@ -126,13 +168,16 @@ class ExperimentConfig:
             f"=== Experiment: {self.experiment_name} ({self.experiment_tag}) ===",
             f"  Description: {self.description or '(none)'}",
             f"  Seed: {self.seed}",
-            f"  [D2] Token-Clipped KL: {'ON' if self.enable_token_clipped_kl else 'OFF'}"
-            + (f" (D_max={self.kl_d_max})" if self.enable_token_clipped_kl else ""),
-            f"  [D3] Length Penalty:    {'ON' if self.enable_length_penalty else 'OFF'}"
-            + (f" (α={self.length_penalty_alpha}, β={self.length_penalty_beta})" if self.enable_length_penalty else ""),
+            f"  [v3] Dynamic Sampling:  {'ON' if self.enable_dynamic_sampling else 'OFF'}"
+            + (f" (oversample={self.oversample_factor}x, joint_filter={'ON' if self.tgrpo_joint_filtering else 'OFF'})" if self.enable_dynamic_sampling else ""),
+            f"  [v3] Length Bonus:      {'ON' if self.enable_length_bonus else 'OFF'}"
+            + (f" (ω={self.length_bonus_omega}, window=[{self.length_bonus_min}, {self.length_bonus_max}])" if self.enable_length_bonus else ""),
+            f"  [v3] OLS:               {'ON' if self.enable_overlong_reward_shaping else 'OFF'}"
+            + (f" (L_max={self.overlong_max_response_length}, buffer={self.overlong_buffer_length})" if self.enable_overlong_reward_shaping else ""),
             f"  [D1] Causal Reward:     {'ON' if self.enable_causal_reward else 'OFF'}"
             + (f" (β_s={self.softplus_beta}, clip={self.causal_reward_clip})" if self.enable_causal_reward else ""),
-            f"  [Override] len_control: {self.override_len_control if self.override_len_control is not None else 'unchanged (CLI)'}",
+            f"  [D3] Length Penalty:    {'ON' if self.enable_length_penalty else 'OFF'}"
+            + (f" (α={self.length_penalty_alpha}, β={self.length_penalty_beta})" if self.enable_length_penalty else ""),
         ]
         return "\n".join(lines)
 
@@ -168,9 +213,25 @@ class ExperimentConfig:
         else:
             d3_behavior = f"OFF, len_control_resolved={resolved_len_control}"
 
-        d2_behavior = (
-            f"ON, per-token KL clamp max={self.kl_d_max}"
-            if self.enable_token_clipped_kl
+        v3_ds_behavior = (
+            f"ON, oversample={self.oversample_factor}x, "
+            f"joint_filter={'ON' if self.tgrpo_joint_filtering else 'OFF'}"
+            if self.enable_dynamic_sampling
+            else "OFF"
+        )
+
+        v3_bonus_behavior = (
+            f"ON, ω={self.length_bonus_omega}, "
+            f"window=[{self.length_bonus_min}, {self.length_bonus_max}]"
+            if self.enable_length_bonus
+            else "OFF"
+        )
+
+        v3_ols_behavior = (
+            f"ON, L_max={self.overlong_max_response_length}, "
+            f"buffer={self.overlong_buffer_length}, "
+            f"penalty={self.overlong_buffer_penalty}"
+            if self.enable_overlong_reward_shaping
             else "OFF"
         )
 
@@ -182,8 +243,10 @@ class ExperimentConfig:
             f"  Config path: {config_label}",
             f"  Generation mode: {mode}",
             f"  [D1] Causal Reward: {d1_behavior}",
-            f"  [D2] Token-Clipped KL: {d2_behavior}",
             f"  [D3] Length Penalty: {d3_behavior}",
+            f"  [v3] Dynamic Sampling: {v3_ds_behavior}",
+            f"  [v3] Length Bonus: {v3_bonus_behavior}",
+            f"  [v3] OLS: {v3_ols_behavior}",
         ]
         return "\n".join(lines)
 

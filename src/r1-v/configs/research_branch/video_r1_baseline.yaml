@@ -1,0 +1,40 @@
+# Matched local Video-R1 baseline.
+# Video-R1's published configuration (arXiv:2503.21776):
+# D2 off, T-GRPO on, V-R1 length bonus on, β=0.04, symmetric clip.
+# No DAPO components, no D1, no D3, no OLS.
+#
+# β, learning_rate, weight_decay, max_grad_norm, temporal,
+# num_generations, max_new_tokens are controlled by the training launch
+# script (CLI args / DeepSpeed config), NOT this YAML.
+
+experiment_name: video_r1_baseline
+experiment_tag: research-baseline-v1
+description: "Matched local Video-R1 baseline: β=0.04, T-GRPO on, V-R1 bonus only, no DAPO/D1/D3/OLS"
+seed: 42
+
+# ── D2: OFF (Video-R1 has no D2) ──
+enable_token_clipped_kl: false
+
+# ── D3: OFF ──
+enable_length_penalty: false
+
+# ── D1: OFF ──
+enable_causal_reward: false
+
+# ── No DAPO components ──
+enable_dynamic_sampling: false
+filter_zero_std_groups: false
+oversample_factor: 1.0
+
+# ── Symmetric clipping (standard PPO, no Clip-Higher) ──
+epsilon_low: 0.2
+epsilon_high: 0.2
+
+# ── Video-R1 length bonus (the original mechanism) ──
+enable_length_bonus: true
+length_bonus_min: 320
+length_bonus_max: 512
+length_bonus_omega: 0.2
+
+# ── No OLS ──
+enable_overlong_reward_shaping: false

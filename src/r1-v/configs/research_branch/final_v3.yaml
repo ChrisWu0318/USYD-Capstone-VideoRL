@@ -1,0 +1,43 @@
+# v3 final configuration: D2 removed, β=0.04 (matching Video-R1),
+# DAPO Dynamic Sampling (T-GRPO joint filter) + Overlong Reward Shaping,
+# Video-R1 length bonus, D1 disabled.
+#
+# β, learning_rate, weight_decay, max_grad_norm, temporal,
+# num_generations, max_new_tokens are controlled by the training launch
+# script (CLI args / DeepSpeed config), NOT this YAML.
+
+experiment_name: final_v3
+experiment_tag: research-final-v3
+description: "v3: D2 removed, β=0.04, DAPO Dynamic Sampling + OLS, V-R1 length bonus, D1 disabled"
+seed: 42
+
+# ── D2: REMOVED (raises ValueError if set to true) ──
+enable_token_clipped_kl: false
+
+# ── D3: DISABLED (replaced by bonus + OLS) ──
+enable_length_penalty: false
+
+# ── D1: DISABLED ──
+enable_causal_reward: false
+
+# ── v3: DAPO Dynamic Sampling with T-GRPO joint filtering ──
+enable_dynamic_sampling: true
+filter_zero_std_groups: true
+oversample_factor: 1.5
+dynamic_sampling_max_retries: 3
+tgrpo_joint_filtering: true
+
+# ── v3: DAPO Clip-Higher (reserved for future; loss has no importance sampling) ──
+epsilon_low: 0.2
+epsilon_high: 0.2
+
+# ── v3: Length control (two-layer orthogonal mechanism) ──
+enable_length_bonus: true
+length_bonus_min: 320
+length_bonus_max: 512
+length_bonus_omega: 0.2
+
+enable_overlong_reward_shaping: true
+overlong_max_response_length: 768
+overlong_buffer_length: 256
+overlong_buffer_penalty: 1.0
